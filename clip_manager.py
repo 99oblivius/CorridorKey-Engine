@@ -19,6 +19,7 @@ from device_utils import resolve_device
 
 if TYPE_CHECKING:
     from gvm_core import GVMProcessor
+    from birefnet_core import BiRefNetProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,66 @@ def generate_alphas(clips, device=None):
 
         except Exception as e:
             logger.error(f"Error generating alpha for {clip.name}: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+
+def get_birefnet_processor(device: str = "cpu") -> BiRefNetProcessor:
+    try:
+        from birefnet_core import BiRefNetProcessor
+
+        return BiRefNetProcessor(device=device)
+    except ImportError:
+        raise ImportError(
+            "Could not import birefnet_core. Please ensure 'birefnet_core' is in the project root and requirements are installed."
+        ) from None
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize BiRefNet Processor: {e}") from e
+
+
+def generate_alphas_birefnet(clips, device=None):
+    """Generate coarse alpha hints using BiRefNet salient object segmentation.
+
+    This is a lightweight alternative to GVM that runs on consumer GPUs (~4 GB VRAM).
+    """
+    clips_to_process = [c for c in clips if c.alpha_asset is None]
+
+    if not clips_to_process:
+        logger.info("All clips have valid Alpha assets. No generation needed.")
+        return
+
+    logger.info(f"Found {len(clips_to_process)} clips missing Alpha.")
+
+    if device is None:
+        device = resolve_device()
+
+    try:
+        processor = get_birefnet_processor(device=device)
+    except ImportError as e:
+        logger.error(f"BiRefNet Import Error: {e}")
+        logger.error("Skipping BiRefNet generation. Please install BiRefNet requirements if you wish to use this feature.")
+        return
+    except Exception as e:
+        logger.error(f"BiRefNet Initialization Error: {e}")
+        return
+
+    for clip in clips_to_process:
+        logger.info(f"Generating Alpha (BiRefNet) for: {clip.name}")
+
+        alpha_output_dir = os.path.join(clip.root_path, "AlphaHint")
+        if os.path.exists(alpha_output_dir):
+            shutil.rmtree(alpha_output_dir)
+        os.makedirs(alpha_output_dir, exist_ok=True)
+
+        try:
+            count = processor.process_sequence(
+                input_path=clip.input_asset.path,
+                output_dir=alpha_output_dir,
+            )
+            logger.info(f"Saved {count} alpha frames to {alpha_output_dir}")
+        except Exception as e:
+            logger.error(f"Error generating alpha (BiRefNet) for {clip.name}: {e}")
             import traceback
 
             traceback.print_exc()
@@ -886,7 +947,7 @@ def scan_clips() -> list[ClipEntry]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
-    parser.add_argument("--action", choices=["generate_alphas", "run_inference", "list", "wizard"], required=True)
+    parser.add_argument("--action", choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"], required=True)
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
     parser.add_argument(
         "--device",
@@ -917,6 +978,9 @@ if __name__ == "__main__":
     elif args.action == "generate_alphas":
         clips = scan_clips()
         generate_alphas(clips, device=device)
+    elif args.action == "generate_alphas_birefnet":
+        clips = scan_clips()
+        generate_alphas_birefnet(clips, device=device)
     elif args.action == "run_inference":
         clips = scan_clips()
         run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames)

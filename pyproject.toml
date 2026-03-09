@@ -29,6 +29,9 @@ dependencies = [
     "imageio",
     "matplotlib",
 
+    # BiRefNet alpha hint generator (lightweight, ~4GB VRAM, MIT license)
+    "kornia",
+
     # VideoMaMa alpha hint generator
     "einops",
 
@@ -52,7 +55,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["CorridorKeyModule", "gvm_core", "VideoMaMaInferenceModule"]
+packages = ["CorridorKeyModule", "gvm_core", "birefnet_core", "VideoMaMaInferenceModule"]
 
 [tool.ruff]
 target-version = "py311"

@@ -25,6 +25,7 @@ from clip_manager import (
     LINUX_MOUNT_ROOT,
     ClipEntry,
     generate_alphas,
+    generate_alphas_birefnet,
     is_video_file,
     map_path,
     organize_target,
@@ -233,6 +234,7 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
         if missing_alpha:
             print(f"  [v] Run VideoMaMa (Found {len(masked)} ready with masks)")
             print(f"  [g] Run GVM (Auto-Matte on {len(raw)} clips without Mask Hint)")
+            print(f"  [b] Run BiRefNet (Lightweight auto-matte on {len(raw)} clips, ~4GB VRAM)")
 
         if ready:
             print(f"  [i] Run Inference (on {len(ready)} ready clips)")
@@ -260,6 +262,17 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
             if yn == "y":
                 generate_alphas(raw, device=device)
                 input("GVM batch complete. Press Enter to Re-Scan...")
+            continue
+
+        elif choice == "b":
+            # BiRefNet
+            print("\n--- BiRefNet Auto-Matte ---")
+            print(f"This will generate alphas for {len(raw)} clips using BiRefNet (~4GB VRAM).")
+
+            yn = input("Proceed with BiRefNet? [y/N]: ").strip().lower()
+            if yn == "y":
+                generate_alphas_birefnet(raw, device=device)
+                input("BiRefNet batch complete. Press Enter to Re-Scan...")
             continue
 
         elif choice == "i":
@@ -290,7 +303,7 @@ def main() -> None:
     _configure_environment()
 
     parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
-    parser.add_argument("--action", choices=["generate_alphas", "run_inference", "list", "wizard"], required=True)
+    parser.add_argument("--action", choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"], required=True)
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
     parser.add_argument(
         "--device",
@@ -310,6 +323,9 @@ def main() -> None:
         elif args.action == "generate_alphas":
             clips = scan_clips()
             generate_alphas(clips, device=device)
+        elif args.action == "generate_alphas_birefnet":
+            clips = scan_clips()
+            generate_alphas_birefnet(clips, device=device)
         elif args.action == "run_inference":
             clips = scan_clips()
             run_inference(clips, device=device)
