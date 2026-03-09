@@ -16,6 +16,8 @@ dependencies = [
     "opencv-python",
     "tqdm",
     "setuptools",
+    # Triton for torch.compile (Windows needs a dedicated package)
+    "triton-windows==3.6.0.post25 ; sys_platform == 'win32'",
 
     # GVM alpha hint generator
     "diffusers",
@@ -91,9 +93,12 @@ omit = [
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu126"
+url = "https://download.pytorch.org/whl/cu128"  # cu128 required for RTX 5000 series
 explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch", marker = "sys_platform != 'darwin'" }
 torchvision = { index = "pytorch", marker = "sys_platform != 'darwin'" }
+# Hiera FlashAttention fix: upstream timm expects 5D attention tensors,
+# this fork produces contiguous 4D tensors for PyTorch's fused SDPA kernel
+timm = { git = "https://github.com/Raiden129/pytorch-image-models-fix", branch = "fix/hiera-flash-attention-global-4d" }

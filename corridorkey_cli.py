@@ -48,7 +48,7 @@ def _configure_environment() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def interactive_wizard(win_path: str, device: str | None = None) -> None:
+def interactive_wizard(win_path: str, device: str | None = None, devices: list[str] | None = None, backend: str | None = None, optimization_config=None, img_size: int = 2048, read_workers: int = 0, write_workers: int = 0) -> None:
     print("\n" + "=" * 60)
     print(" CORRIDOR KEY - SMART WIZARD")
     print("=" * 60)
@@ -279,7 +279,7 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
             # Inference
             print("\n--- Corridor Key Inference ---")
             try:
-                run_inference(ready, device=device)
+                run_inference(ready, device=device, devices=devices, backend=backend, optimization_config=optimization_config, img_size=img_size, read_workers=read_workers, write_workers=write_workers)
             except (RuntimeError, FileNotFoundError) as e:
                 logger.error(f"Inference failed: {e}")
             input("Inference batch complete. Press Enter to Re-Scan...")
@@ -312,6 +312,12 @@ def main() -> None:
         help="Compute device (default: auto-detect CUDA > MPS > CPU)",
     )
     parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated GPU indices for multi-GPU inference (e.g. 0,1). "
+        "Overrides --device for the async pipeline.",
+    )
+    parser.add_argument(
         "--backend",
         choices=["auto", "torch", "torch_optimized", "mlx"],
         default="auto",
@@ -337,15 +343,24 @@ def main() -> None:
     parser.add_argument("--no-disable-cudnn-benchmark", dest="disable_cudnn_benchmark", action="store_false")
     parser.add_argument("--token-routing", action="store_true", default=None, help="Enable experimental token routing")
     parser.add_argument("--no-token-routing", dest="token_routing", action="store_false")
+    parser.add_argument("--img-size", type=int, default=2048, help="Model input resolution (default: 2048)")
     parser.add_argument("--tile-size", type=int, default=None, help="Tile size for tiled refiner (default: 512)")
     parser.add_argument("--tile-overlap", type=int, default=None, help="Tile overlap in pixels (default: 128)")
     parser.add_argument("--metrics", action="store_true", default=False, help="Enable per-stage performance metrics")
+    parser.add_argument("--read-workers", type=int, default=0, help="Reader thread pool size (0=auto: 2 per GPU)")
+    parser.add_argument("--write-workers", type=int, default=0, help="Total writer threads, split across GPUs (0=auto: all remaining cores)")
 
     args = parser.parse_args()
 
     device = resolve_device(args.device)
     backend = args.backend
     logger.info(f"Using device: {device}, backend: {backend}")
+
+    # Parse --devices into list of cuda:N strings
+    devices_list = None
+    if args.devices:
+        devices_list = [f"cuda:{idx.strip()}" for idx in args.devices.split(",")]
+        logger.info(f"Multi-GPU devices: {devices_list}")
 
     # Build OptimizationConfig from profile + overrides
     optimization_config = _build_optimization_config(args)
@@ -363,12 +378,12 @@ def main() -> None:
             generate_alphas_birefnet(clips, device=device)
         elif args.action == "run_inference":
             clips = scan_clips()
-            run_inference(clips, device=device, backend=backend, optimization_config=optimization_config)
+            run_inference(clips, device=device, backend=backend, optimization_config=optimization_config, devices=devices_list, img_size=args.img_size, read_workers=args.read_workers, write_workers=args.write_workers)
         elif args.action == "wizard":
             if not args.win_path:
                 print("Error: --win_path required for wizard.")
             else:
-                interactive_wizard(args.win_path, device=device)
+                interactive_wizard(args.win_path, device=device, devices=devices_list, backend=backend, optimization_config=optimization_config, img_size=args.img_size, read_workers=args.read_workers, write_workers=args.write_workers)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(130)

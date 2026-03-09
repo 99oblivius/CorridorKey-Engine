@@ -556,7 +556,38 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
             traceback.print_exc()
 
 
-def run_inference(clips, device=None, backend=None, max_frames=None, optimization_config=None):
+def _extract_video_frames(video_path: str, output_dir: str, max_frames: int | None = None) -> list[str]:
+    """Extract video frames to PNGs using ffmpeg (hardware-accelerated)."""
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        from backend.ffmpeg_tools import extract_frames
+        extract_frames(
+            video_path,
+            output_dir,
+            pattern="%05d.png",
+            total_frames=max_frames or 0,
+        )
+    except (ImportError, RuntimeError):
+        # Fallback to cv2 if ffmpeg unavailable
+        cap = cv2.VideoCapture(video_path)
+        idx = 0
+        while True:
+            if max_frames is not None and idx >= max_frames:
+                break
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cv2.imwrite(os.path.join(output_dir, f"{idx:05d}.png"), frame)
+            idx += 1
+        cap.release()
+
+    paths = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+    if max_frames is not None:
+        paths = paths[:max_frames]
+    return paths
+
+
+def run_inference(clips, device=None, backend=None, max_frames=None, optimization_config=None, devices=None, img_size=2048, read_workers=0, write_workers=0):
     ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
 
     if not ready_clips:
@@ -621,13 +652,22 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    import numpy as np
+    # --- Initialize Async Pipeline ---
+    from backend.async_pipeline import AsyncInferencePipeline, InferenceSettings, PipelineConfig
 
-    if device is None:
-        device = resolve_device()
-    from CorridorKeyModule.backend import create_engine
+    config = PipelineConfig(img_size=img_size, backend=backend, devices=devices, optimization_config=optimization_config, read_workers=read_workers, write_workers=write_workers)
+    pipeline = AsyncInferencePipeline(config)
+    pipeline.load_engines()
 
-    engine = create_engine(backend=backend, device=device, optimization_config=optimization_config)
+    settings = InferenceSettings(
+        input_is_linear=user_input_is_linear,
+        despill_strength=despill_strength,
+        auto_despeckle=auto_despeckle,
+        despeckle_size=despeckle_size,
+        refiner_scale=refiner_scale,
+    )
+
+    import tempfile
 
     for clip in ready_clips:
         logger.info(f"Running Inference on: {clip.name}")
@@ -654,150 +694,50 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
             logger.warning(f"Clip '{clip.name}': 0 frames to process, skipping.")
             continue
 
-        input_cap = None
-        alpha_cap = None
-        input_files = []
-        alpha_files = []
-
-        if clip.input_asset.type == "video":
-            input_cap = cv2.VideoCapture(clip.input_asset.path)
-        else:
-            input_files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
-
-        if clip.alpha_asset.type == "video":
-            alpha_cap = cv2.VideoCapture(clip.alpha_asset.path)
-        else:
-            alpha_files = sorted([f for f in os.listdir(clip.alpha_asset.path) if is_image_file(f)])
-
-        for i in range(num_frames):
-            if i % 10 == 0:
-                print(f"  Frame {i}/{num_frames}...", end="\r")
-
-            # 1. Read Input
-            img_srgb = None
-            input_stem = f"{i:05d}"
-
-            # Use the user-defined gamma
-            input_is_linear = user_input_is_linear
-
-            if input_cap:
-                ret, frame = input_cap.read()
-                if not ret:
-                    break
-                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_srgb = img_rgb.astype(np.float32) / 255.0
-                input_stem = f"{i:05d}"
+        # --- Build explicit frame path lists ---
+        # Video inputs must be pre-extracted for parallel reading
+        tmp_dirs = []
+        try:
+            if clip.input_asset.type == "video":
+                tmp_input = tempfile.mkdtemp(prefix="ck_input_")
+                tmp_dirs.append(tmp_input)
+                logger.info("  Extracting video frames for parallel processing...")
+                extracted = _extract_video_frames(clip.input_asset.path, tmp_input, max_frames=num_frames)
+                input_paths = extracted
+                input_stems = [f"{i:05d}" for i in range(len(extracted))]
             else:
-                fpath = os.path.join(clip.input_asset.path, input_files[i])
-                input_stem = os.path.splitext(input_files[i])[0]
+                input_files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
+                input_paths = [os.path.join(clip.input_asset.path, f) for f in input_files[:num_frames]]
+                input_stems = [os.path.splitext(f)[0] for f in input_files[:num_frames]]
 
-                is_exr = fpath.lower().endswith(".exr")
-                if is_exr:
-                    img_linear = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
-                    if img_linear is None:
-                        continue
-                    img_linear_rgb = cv2.cvtColor(img_linear, cv2.COLOR_BGR2RGB)
-                    # Support overriding EXR behavior if user picked 's'
-                    img_srgb = np.maximum(img_linear_rgb, 0.0)
-                else:
-                    img_bgr = cv2.imread(fpath)
-                    if img_bgr is None:
-                        continue
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    img_srgb = img_rgb.astype(np.float32) / 255.0
-
-            # 2. Read Alpha (Mask)
-            mask_linear = None
-            if alpha_cap:
-                ret, frame = alpha_cap.read()
-                if not ret:
-                    break
-                mask_linear = frame[:, :, 2].astype(np.float32) / 255.0
+            if clip.alpha_asset.type == "video":
+                tmp_alpha = tempfile.mkdtemp(prefix="ck_alpha_")
+                tmp_dirs.append(tmp_alpha)
+                logger.info("  Extracting alpha video frames...")
+                alpha_paths = _extract_video_frames(clip.alpha_asset.path, tmp_alpha, max_frames=num_frames)
             else:
-                fpath = os.path.join(clip.alpha_asset.path, alpha_files[i])
-                mask_in = cv2.imread(fpath, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_UNCHANGED)
+                alpha_files = sorted([f for f in os.listdir(clip.alpha_asset.path) if is_image_file(f)])
+                alpha_paths = [os.path.join(clip.alpha_asset.path, f) for f in alpha_files[:num_frames]]
 
-                if mask_in is None:
-                    continue
-
-                if mask_in.ndim == 3:
-                    if mask_in.shape[2] == 3:
-                        mask_linear = mask_in[:, :, 0]
-                    else:
-                        mask_linear = mask_in
-                else:
-                    mask_linear = mask_in
-
-                if mask_linear.dtype == np.uint8:
-                    mask_linear = mask_linear.astype(np.float32) / 255.0
-                elif mask_linear.dtype == np.uint16:
-                    mask_linear = mask_linear.astype(np.float32) / 65535.0
-                else:
-                    mask_linear = mask_linear.astype(np.float32)
-
-            if mask_linear.shape[:2] != img_srgb.shape[:2]:
-                mask_linear = cv2.resize(
-                    mask_linear, (img_srgb.shape[1], img_srgb.shape[0]), interpolation=cv2.INTER_LINEAR
-                )
-
-            # 3. Process
-            USE_STRAIGHT_MODEL = True
-            res = engine.process_frame(
-                img_srgb,
-                mask_linear,
-                input_is_linear=input_is_linear,
-                fg_is_straight=USE_STRAIGHT_MODEL,
-                despill_strength=despill_strength,
-                auto_despeckle=auto_despeckle,
-                despeckle_size=despeckle_size,
-                refiner_scale=refiner_scale,
+            # Run pipeline
+            result = pipeline.process_clip(
+                input_paths=input_paths,
+                alpha_paths=alpha_paths,
+                input_stems=input_stems,
+                output_dirs={"fg": fg_dir, "matte": matte_dir, "comp": comp_dir, "processed": proc_dir},
+                settings=settings,
+                max_frames=max_frames,
             )
 
-            pred_fg = res["fg"]  # sRGB
-            pred_alpha = res["alpha"]  # Linear
+            logger.info(
+                f"Clip {clip.name} Complete: {result['completed']}/{result['total']} frames"
+                f" ({result['failed']} failed)"
+            )
 
-            # 4. Save (EXR DWAB Half-Float)
-
-            # Compression Params
-            exr_flags = [
-                cv2.IMWRITE_EXR_TYPE,
-                cv2.IMWRITE_EXR_TYPE_HALF,
-                # DWAB fails. PXR24 verified as smallest working format (46KB vs ZIP 56KB vs B44A 688KB)
-                cv2.IMWRITE_EXR_COMPRESSION,
-                cv2.IMWRITE_EXR_COMPRESSION_PXR24,
-            ]
-
-            # Save FG
-            # pred_fg is RGB 0-1 float. Convert to BGR for OpenCV
-            fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(fg_dir, f"{input_stem}.exr"), fg_bgr, exr_flags)
-
-            # Save Matte
-            if pred_alpha.ndim == 3:
-                pred_alpha = pred_alpha[:, :, 0]
-            # Matte is single channel linear float
-            cv2.imwrite(os.path.join(matte_dir, f"{input_stem}.exr"), pred_alpha, exr_flags)
-
-            # 5. Generate Reference Comp
-            comp_srgb = res["comp"]
-            # Save Comp (PNG 8-bit)
-            comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgr)
-
-            # 6. Save Processed (RGBA EXR)
-            if "processed" in res:
-                # Result is RGBA
-                proc_rgba = res["processed"]
-                # Convert to BGRA for OpenCV
-                proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
-                cv2.imwrite(os.path.join(proc_dir, f"{input_stem}.exr"), proc_bgra, exr_flags)
-
-        print("")
-        if input_cap:
-            input_cap.release()
-        if alpha_cap:
-            alpha_cap.release()
-        logger.info(f"Clip {clip.name} Complete.")
+        finally:
+            # Clean up temporary extracted frames
+            for tmp in tmp_dirs:
+                shutil.rmtree(tmp, ignore_errors=True)
 
 
 def organize_target(target_dir: str) -> None:
@@ -967,11 +907,21 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of frames to process per clip (e.g. 1 for first frame only)",
     )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated GPU indices to use for inference (e.g. 0,1). Bypasses VRAM auto-detection.",
+    )
 
     args = parser.parse_args()
 
     device = resolve_device(args.device)
     logger.info(f"Using device: {device}")
+
+    # Parse --devices into list of cuda:N strings
+    devices_list = None
+    if args.devices:
+        devices_list = [f"cuda:{idx.strip()}" for idx in args.devices.split(",")]
 
     if args.action == "list":
         scan_clips()
@@ -983,7 +933,7 @@ if __name__ == "__main__":
         generate_alphas_birefnet(clips, device=device)
     elif args.action == "run_inference":
         clips = scan_clips()
-        run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames)
+        run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames, devices=devices_list)
     elif args.action == "wizard":
         if not args.win_path:
             print("Error: --win_path required for wizard.")

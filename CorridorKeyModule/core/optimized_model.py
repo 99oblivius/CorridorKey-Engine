@@ -278,6 +278,7 @@ class TiledCNNRefiner(CNNRefinerModule):
         super().__init__(in_channels, hidden_channels, out_channels)
         self.tile_size = tile_size
         self.tile_overlap = tile_overlap
+        self._blend_cache: dict[tuple[int, int], torch.Tensor] = {}
 
     def _create_blend_weight(
         self, h: int, w: int, overlap: int, device: torch.device, dtype: torch.dtype
@@ -355,7 +356,12 @@ class TiledCNNRefiner(CNNRefinerModule):
                 tile_delta = self._process_tile(tile)
 
                 tile_h, tile_w = tile_delta.shape[2], tile_delta.shape[3]
-                blend_w = self._create_blend_weight(tile_h, tile_w, self.tile_overlap, img.device, img.dtype)
+                cache_key = (tile_h, tile_w)
+                if cache_key not in self._blend_cache:
+                    self._blend_cache[cache_key] = self._create_blend_weight(
+                        tile_h, tile_w, self.tile_overlap, img.device, img.dtype
+                    )
+                blend_w = self._blend_cache[cache_key]
 
                 delta_sum[:, :, y0_adj:y1, x0_adj:x1] += tile_delta * blend_w
                 weight_sum[:, :, y0_adj:y1, x0_adj:x1] += blend_w

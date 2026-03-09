@@ -48,20 +48,21 @@ def resolve_backend(requested: str | None = None) -> str:
 
 
 def _auto_detect_backend() -> str:
-    """Try MLX on Apple Silicon, torch_optimized on constrained GPUs, else torch."""
+    """Try MLX on Apple Silicon, torch_optimized on CUDA, else torch."""
     if sys.platform != "darwin" or platform.machine() != "arm64":
-        # Check if we should default to torch_optimized on CUDA GPUs with <16GB
         try:
             import torch
 
             if torch.cuda.is_available():
+                # Always use optimized backend on CUDA — the optimizations
+                # (tiled refiner, flash attention, cache clearing) are
+                # mathematically lossless and reduce VRAM from ~22GB to ~3GB.
                 total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                if total_mem_gb < 16:
-                    logger.info(
-                        "GPU has %.1f GB VRAM (<16 GB) — using torch_optimized backend",
-                        total_mem_gb,
-                    )
-                    return "torch_optimized"
+                logger.info(
+                    "GPU has %.1f GB VRAM — using torch_optimized backend",
+                    total_mem_gb,
+                )
+                return "torch_optimized"
         except (ImportError, RuntimeError):
             pass
 

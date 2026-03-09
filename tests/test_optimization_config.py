@@ -97,11 +97,13 @@ class TestOptimizationConfigHelpers:
     def test_active_optimizations_optimized(self):
         cfg = OptimizationConfig.optimized()
         active = cfg.active_optimizations()
-        assert len(active) == 4
+        assert len(active) == 6
         assert "flash_attention" in active
         assert any("tiled_refiner" in a for a in active)
         assert "disable_cudnn_benchmark" in active
         assert "cache_clearing" in active
+        assert "model_float16" in active
+        assert "tf32_matmul" in active
 
     def test_active_optimizations_single(self):
         cfg = OptimizationConfig(flash_attention=True)

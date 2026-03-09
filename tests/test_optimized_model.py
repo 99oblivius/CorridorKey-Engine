@@ -303,8 +303,13 @@ class TestOptimizedEngineAPI:
         engine.checkpoint_path = "/fake/checkpoint.pth"
         engine.use_refiner = False
         engine.config = OptimizationConfig.optimized()
-        engine.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        engine.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        engine.mean_np = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        engine.std_np = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        engine._mean_t = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        engine._std_t = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        engine._checker_cache = {}
+        engine._refiner_scale = 1.0
+        engine._refiner_hook_handle = None
         engine.model = mock_model
         return engine
 

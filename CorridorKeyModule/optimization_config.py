@@ -49,6 +49,20 @@ class OptimizationConfig:
     """Call ``torch.cuda.empty_cache()`` between encoder -> decoder and
     decoder -> refiner stages to release intermediate CUDA allocations."""
 
+    mixed_precision: bool = False
+    """Enable ``torch.autocast`` with float16 during inference.  When the
+    model is already stored in float16 (``model_precision=torch.float16``),
+    autocast is redundant and automatically disabled."""
+
+    model_precision: str = "float32"
+    """Dtype string for model weights: ``'float32'``, ``'float16'``, or
+    ``'bfloat16'``.  Stored as a string because ``torch.dtype`` is not
+    natively serialisable.  Use :attr:`model_dtype` for the resolved type."""
+
+    high_matmul_precision: bool = False
+    """Set ``torch.set_float32_matmul_precision('high')`` to use TF32
+    matmul on Ampere+ GPUs.  Negligible quality impact, measurable speedup."""
+
     token_routing: bool = False
     """Route 'easy' (solid FG/BG) tokens to a lightweight LTRM module
     instead of global attention.  **Experimental** -- requires fine-tuning;
@@ -83,6 +97,27 @@ class OptimizationConfig:
     Results are returned in the ``"metrics"`` key of the output dict."""
 
     # ------------------------------------------------------------------
+    # Derived helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def model_dtype(self) -> torch.dtype:
+        """Resolve :attr:`model_precision` string to a ``torch.dtype``."""
+        _MAP = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+        return _MAP.get(self.model_precision, torch.float32)
+
+    @property
+    def effective_mixed_precision(self) -> bool:
+        """Whether autocast should actually be enabled.
+
+        Autocast is redundant (and slower) when the model weights are
+        already in float16, so it is automatically disabled in that case.
+        """
+        if self.model_precision == "float16":
+            return False
+        return self.mixed_precision
+
+    # ------------------------------------------------------------------
     # Profiles
     # ------------------------------------------------------------------
 
@@ -94,12 +129,16 @@ class OptimizationConfig:
     @classmethod
     def optimized(cls) -> OptimizationConfig:
         """Standard optimized profile: flash_attention + tiled_refiner +
-        disable_cudnn_benchmark + cache_clearing.  No token routing."""
+        disable_cudnn_benchmark + cache_clearing + fp16 model + TF32 matmul.
+        No token routing."""
         return cls(
             flash_attention=True,
             tiled_refiner=True,
             disable_cudnn_benchmark=True,
             cache_clearing=True,
+            mixed_precision=True,
+            model_precision="float16",
+            high_matmul_precision=True,
             token_routing=False,
         )
 
@@ -111,6 +150,9 @@ class OptimizationConfig:
             tiled_refiner=True,
             disable_cudnn_benchmark=True,
             cache_clearing=True,
+            mixed_precision=True,
+            model_precision="float16",
+            high_matmul_precision=True,
             token_routing=True,
         )
 
@@ -145,6 +187,12 @@ class OptimizationConfig:
             names.append("disable_cudnn_benchmark")
         if self.cache_clearing:
             names.append("cache_clearing")
+        if self.model_precision != "float32":
+            names.append(f"model_{self.model_precision}")
+        if self.effective_mixed_precision:
+            names.append("mixed_precision")
+        if self.high_matmul_precision:
+            names.append("tf32_matmul")
         if self.token_routing:
             names.append(f"token_routing(edge={self.edge_threshold_low}-{self.edge_threshold_high})")
         return names

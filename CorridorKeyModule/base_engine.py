@@ -8,8 +8,10 @@ model variant.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
+import sys
 from abc import ABC, abstractmethod
 
 import cv2
@@ -20,6 +22,32 @@ import torch.nn.functional as F
 
 from .core import color_utils as cu
 from .optimization_config import OptimizationConfig, PerformanceMetrics
+
+
+@dataclasses.dataclass
+class PendingTransfer:
+    """Handle for a deferred GPU→CPU DMA transfer.
+
+    Returned by ``_postprocess_gpu(sync=False)``.  Call :meth:`resolve`
+    to block until the DMA completes and get the numpy result dict.
+    """
+
+    _copy_stream: torch.cuda.Stream | None
+    _pinned_buf: torch.Tensor | None
+    _cpu_result: dict[str, np.ndarray] | None  # set for CPU fallback
+
+    def resolve(self) -> dict[str, np.ndarray]:
+        """Block until DMA completes, return numpy arrays."""
+        if self._cpu_result is not None:
+            return self._cpu_result
+        self._copy_stream.synchronize()
+        bulk_np = self._pinned_buf.numpy()
+        return {
+            "alpha": bulk_np[:, :, 0:1].copy(),
+            "fg": bulk_np[:, :, 1:4].copy(),
+            "comp": bulk_np[:, :, 4:7].copy(),
+            "processed": bulk_np[:, :, 7:11].copy(),
+        }
 
 
 class _BaseCorridorKeyEngine(ABC):
@@ -44,16 +72,83 @@ class _BaseCorridorKeyEngine(ABC):
         self.use_refiner = use_refiner
         self.config = optimization_config or OptimizationConfig()
 
-        # ImageNet normalization constants
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        # ImageNet normalization constants (keep on device for GPU preprocessing)
+        self.mean_np = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        self.std_np = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+        # GPU-side normalization constants (created after model load)
+        self._mean_t: torch.Tensor | None = None
+        self._std_t: torch.Tensor | None = None
+
+        # Cached checkerboard (per-resolution, avoids re-allocation every frame)
+        self._checker_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+        # Dedicated copy stream for GPU→CPU transfers (avoids GIL contention
+        # in multi-GPU setups).  Compute runs on the default stream; D2H
+        # copies run on _copy_stream so stream.synchronize() only waits for
+        # the copy, releasing the GIL without blocking other GPUs' compute.
+        self._copy_stream: torch.cuda.Stream | None = None
+        # Double-buffered pinned-memory for D2H transfer.  Two buffers
+        # allow deferred DMA: frame N's transfer runs on the copy stream
+        # while frame N+1's forward runs on the compute stream, using the
+        # other buffer.  Avoids per-frame cudaHostAlloc (~100ms overhead).
+        self._pinned_bufs: list[torch.Tensor | None] = [None, None]
+        self._pinned_shapes: list[tuple] = [(), ()]
+        self._pinned_idx: int = 0
+
+        # Refiner scale hook (registered once, controlled via attribute)
+        self._refiner_scale: float = 1.0
+        self._refiner_hook_handle = None
 
         # Engine-level optimization: disable cuDNN benchmark
         if self.config.disable_cudnn_benchmark and self.device.type == "cuda":
             torch.backends.cudnn.benchmark = False
             print("[Optimized] cuDNN benchmark disabled (saves 2-5 GB workspace).")
 
+        # TF32 matmul precision (Ampere+): negligible quality impact, measurable speedup
+        if self.config.high_matmul_precision:
+            torch.set_float32_matmul_precision("high")
+            print("[Optimized] TF32 matmul precision enabled.")
+
         self.model = self._load_model()
+
+        # Normalization constants on device (used by process_raw and process_prepared GPU paths)
+        self._mean_t = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        self._std_t = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+
+        # Register persistent refiner scale hook (must be before torch.compile)
+        if self.model.refiner is not None:
+            def _scale_hook(module, input, output):
+                if self._refiner_scale != 1.0:
+                    return output * self._refiner_scale
+                return output
+            self._refiner_hook_handle = self.model.refiner.register_forward_hook(_scale_hook)
+
+        # torch.compile: JIT-compile the model for fused kernels and optimized memory.
+        # Applied at instance level (not class decorator) to avoid conflict with
+        # timm's FX-based feature extraction.  Must be after hook registration so
+        # hooks are baked into the compiled graph instead of causing graph breaks.
+        # Based on work by Marcel Lieb (https://github.com/MarcelLieb/CorridorKey)
+        if sys.platform in ("linux", "win32") and self.device.type == "cuda":
+            # Enable FX graph cache so graph tracing + inductor lowering
+            # (the single-threaded phases) are skipped on subsequent runs.
+            # Only the first run pays the full compilation cost.
+            import torch._inductor.config as _inductor_cfg
+            _inductor_cfg.fx_graph_cache = True
+
+            self.model = torch.compile(self.model)
+            print("[Optimized] torch.compile enabled (FX cache).")
+
+        # Create copy stream after model is loaded (avoids interfering with compile)
+        if self.device.type == "cuda":
+            self._copy_stream = torch.cuda.Stream(device=self.device)
+            # Pre-allocated CUDA events for timing (avoids per-frame cudaEventCreate)
+            self._ev_timing = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+
+        # Freeze batch size at init time (VRAM is most stable right after
+        # model load).  Must not change at runtime or torch.compile will
+        # retrace for the new shape.
+        self._max_batch_size = self._compute_max_batch_size()
 
     # ------------------------------------------------------------------
     # Subclass hooks
@@ -90,7 +185,7 @@ class _BaseCorridorKeyEngine(ABC):
         print(f"Loading CorridorKey from {self.checkpoint_path}...")
 
         model = self._create_model()
-        model = model.to(self.device)
+        model = model.to(self.config.model_dtype).to(self.device)
         model.eval()
 
         if not os.path.isfile(self.checkpoint_path):
@@ -127,6 +222,8 @@ class _BaseCorridorKeyEngine(ABC):
         self._report_load_results(missing, unexpected)
 
         # Report VRAM after loading
+        if self.config.model_precision != "float32":
+            print(f"[Optimized] Model weights stored in {self.config.model_precision}.")
         if self.device.type == "cuda":
             allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
             print(f"Model loaded. GPU memory: {allocated:.2f} GB")
@@ -134,10 +231,82 @@ class _BaseCorridorKeyEngine(ABC):
         return model
 
     # ------------------------------------------------------------------
+    # GPU-side helpers
+    # ------------------------------------------------------------------
+
+    def _get_checkerboard_gpu(self, w: int, h: int) -> torch.Tensor:
+        """Return a cached checkerboard tensor [H, W, 3] on device."""
+        key = (w, h)
+        if key not in self._checker_cache:
+            checker_size = 128
+            y_coords = torch.arange(h, device=self.device) // checker_size
+            x_coords = torch.arange(w, device=self.device) // checker_size
+            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
+            checker = ((x_grid + y_grid) % 2).float()
+            # Map 0 -> 0.15, 1 -> 0.55
+            bg = checker * 0.4 + 0.15  # [H, W]
+            self._checker_cache[key] = bg.unsqueeze(-1).expand(-1, -1, 3)
+        return self._checker_cache[key]
+
+    @staticmethod
+    def _clean_matte_gpu(alpha: torch.Tensor, area_threshold: int, dilation: int, blur_size: int) -> torch.Tensor:
+        """Fully GPU matte cleanup using morphological operations.
+
+        Approximates connected-component removal by eroding small regions
+        away, then dilating back.  Avoids the GPU→CPU→GPU roundtrip that
+        ``cv2.connectedComponentsWithStats`` would require.
+
+        The erosion radius is derived from ``area_threshold``: a circular
+        spot of area A has radius sqrt(A/pi), so erosion by that radius
+        eliminates it.
+        """
+        device = alpha.device
+        # alpha: [H, W, 1]
+        a2d = alpha[:, :, 0]
+        mask = (a2d > 0.5).float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
+        # Erode: kill spots smaller than area_threshold
+        # A circle of area A has radius r = sqrt(A / pi)
+        import math
+        erode_r = max(1, int(math.sqrt(area_threshold / math.pi)))
+        erode_k = erode_r * 2 + 1
+        # Erosion = negative of max_pool on negated mask
+        mask = -F.max_pool2d(-mask, erode_k, stride=1, padding=erode_r)
+
+        # Dilate back to restore edges of large regions
+        dilate_r = erode_r + (dilation if dilation > 0 else 0)
+        dilate_k = dilate_r * 2 + 1
+        mask = F.max_pool2d(mask, dilate_k, stride=1, padding=dilate_r)
+
+        # Blur for soft edges
+        if blur_size > 0:
+            k = int(blur_size * 2 + 1)
+            mask = F.avg_pool2d(mask, k, stride=1, padding=blur_size)
+
+        safe = mask.squeeze(0).squeeze(0)  # [H, W]
+        return (a2d * safe).unsqueeze(-1)  # [H, W, 1]
+
+    @staticmethod
+    def _despill_gpu(image: torch.Tensor, strength: float) -> torch.Tensor:
+        """GPU despill — keeps data on device."""
+        if strength <= 0.0:
+            return image
+        r, g, b = image[..., 0], image[..., 1], image[..., 2]
+        limit = (r + b) / 2.0
+        spill = torch.clamp(g - limit, min=0.0)
+        g_new = g - spill
+        r_new = r + spill * 0.5
+        b_new = b + spill * 0.5
+        despilled = torch.stack([r_new, g_new, b_new], dim=-1)
+        if strength < 1.0:
+            return image * (1.0 - strength) + despilled * strength
+        return despilled
+
+    # ------------------------------------------------------------------
     # Frame processing (shared -- THE single implementation)
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def process_frame(
         self,
         image: np.ndarray,
@@ -168,6 +337,7 @@ class _BaseCorridorKeyEngine(ABC):
             ``"processed"``, and optionally ``"metrics"``.
         """
         metrics = PerformanceMetrics() if self.config.enable_metrics else None
+        use_gpu_postprocess = self.device.type == "cuda"
 
         # === 1. Input normalization ===
         if image.dtype == np.uint8:
@@ -191,98 +361,664 @@ class _BaseCorridorKeyEngine(ABC):
         if mask_resized.ndim == 2:
             mask_resized = mask_resized[:, :, np.newaxis]
 
-        # === 3. ImageNet normalization ===
-        img_norm = (img_resized - self.mean) / self.std
+        # === 3. Prepare tensor and normalize on GPU ===
+        inp_np = np.concatenate([img_resized, mask_resized], axis=-1)  # [H, W, 4]
+        # Transfer to GPU, then normalize there to avoid CPU float intermediates
+        inp_t = torch.as_tensor(inp_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+        inp_t = inp_t.to(self.device, non_blocking=True)
 
-        # === 4. Prepare tensor ===
-        inp_np = np.concatenate([img_norm, mask_resized], axis=-1)  # [H, W, 4]
-        inp_t = torch.from_numpy(inp_np.transpose((2, 0, 1))).float().unsqueeze(0).to(self.device)
+        # Normalize RGB channels on GPU, leave mask channel as-is
+        inp_t[:, :3] = (inp_t[:, :3] - self._mean_t) / self._std_t
 
-        # === 5. Inference ===
-        handle = None
-        if refiner_scale != 1.0 and self.model.refiner is not None:
-
-            def scale_hook(module, input, output):
-                return output * refiner_scale
-
-            handle = self.model.refiner.register_forward_hook(scale_hook)
+        # === 4. Inference ===
+        self._refiner_scale = refiner_scale
 
         if metrics is not None:
             ctx = metrics.measure("inference", self.device)
         else:
             from contextlib import nullcontext
-
             ctx = nullcontext()
 
         with ctx:
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.config.effective_mixed_precision,
+            ):
                 out = self.model(inp_t)
 
-        if handle:
-            handle.remove()
+        pred_alpha = out["alpha"]  # [1, 1, model_size, model_size]
+        pred_fg = out["fg"]        # [1, 3, model_size, model_size]
 
-        pred_alpha = out["alpha"]
-        pred_fg = out["fg"]
-
-        # === 6. Post-process (resize back to original resolution) ===
+        # === 5. Post-process ===
         if metrics is not None:
             ctx_post = metrics.measure("postprocess", self.device)
         else:
+            from contextlib import nullcontext
             ctx_post = nullcontext()
 
         with ctx_post:
-            res_alpha = pred_alpha[0].permute(1, 2, 0).float().cpu().numpy()
-            res_fg = pred_fg[0].permute(1, 2, 0).float().cpu().numpy()
-            res_alpha = cv2.resize(res_alpha, (w, h), interpolation=cv2.INTER_LANCZOS4)
-            res_fg = cv2.resize(res_fg, (w, h), interpolation=cv2.INTER_LANCZOS4)
-
-            if res_alpha.ndim == 2:
-                res_alpha = res_alpha[:, :, np.newaxis]
-
-            # A. Clean matte (auto-despeckle)
-            if auto_despeckle:
-                processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=25, blur_size=5)
+            if use_gpu_postprocess:
+                result = self._postprocess_gpu(
+                    pred_alpha, pred_fg, h, w,
+                    auto_despeckle, despeckle_size,
+                    despill_strength, fg_is_straight,
+                )
             else:
-                processed_alpha = res_alpha
-
-            # B. Despill FG
-            fg_despilled = cu.despill(res_fg, green_limit_mode="average", strength=despill_strength)
-
-            # C. Premultiply for EXR (convert to linear first)
-            fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
-            fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
-
-            # D. Pack RGBA (all linear float)
-            processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
-
-            # E. Composite on checkerboard
-            bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
-            bg_lin = cu.srgb_to_linear(bg_srgb)
-
-            if fg_is_straight:
-                comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
-            else:
-                comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
-
-            comp_srgb = cu.linear_to_srgb(comp_lin)
-
-        # === Peak VRAM reporting ===
-        if self.device.type == "cuda":
-            peak = torch.cuda.max_memory_allocated(self.device) / (1024**3)
-            print(f"Peak VRAM: {peak:.2f} GB")
+                result = self._postprocess_cpu(
+                    pred_alpha, pred_fg, h, w,
+                    auto_despeckle, despeckle_size,
+                    despill_strength, fg_is_straight,
+                )
 
         # === Finalize metrics ===
         if metrics is not None:
             metrics.finalize(self.device)
+            result["metrics"] = metrics
 
-        result: dict[str, np.ndarray | PerformanceMetrics] = {
+        return result
+
+    @torch.inference_mode()
+    def process_prepared(
+        self,
+        inp_hwc4: np.ndarray,
+        orig_h: int,
+        orig_w: int,
+        refiner_scale: float = 1.0,
+        fg_is_straight: bool = True,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+        _timings: dict | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Fast path: process a pre-prepared [H,W,4] model input.
+
+        Skips all CPU preprocessing (resize, normalize, concat) — those are
+        done in the reader process.  The only GIL-held work here is
+        ``torch.as_tensor().to(device)`` which is a single memcpy.
+
+        If ``_timings`` dict is passed, per-stage wall-clock times (seconds)
+        are written into it: ``upload``, ``forward``, ``postprocess``.
+        """
+        import time as _time
+
+        t0 = _time.perf_counter() if _timings is not None else 0
+
+        # Single tensor creation + GPU upload (minimal GIL time)
+        # Combine dtype + device into one .to() call to avoid intermediate copy
+        inp_t = (
+            torch.as_tensor(inp_hwc4)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=self.config.model_dtype, non_blocking=True)
+        )
+
+        if _timings is not None:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            t1 = _time.perf_counter()
+            _timings["upload"] = t1 - t0
+        else:
+            t1 = 0
+
+        # Inference (GIL released during CUDA kernels)
+        self._refiner_scale = refiner_scale
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.config.effective_mixed_precision,
+        ):
+            out = self.model(inp_t)
+
+        if _timings is not None:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            t2 = _time.perf_counter()
+            _timings["forward"] = t2 - t1
+        else:
+            t2 = 0
+
+        pred_alpha = out["alpha"]
+        pred_fg = out["fg"]
+
+        # Post-process (GPU path keeps data on device, includes .cpu() transfer)
+        if self.device.type == "cuda":
+            result = self._postprocess_gpu(
+                pred_alpha, pred_fg, orig_h, orig_w,
+                auto_despeckle, despeckle_size,
+                despill_strength, fg_is_straight,
+            )
+        else:
+            result = self._postprocess_cpu(
+                pred_alpha, pred_fg, orig_h, orig_w,
+                auto_despeckle, despeckle_size,
+                despill_strength, fg_is_straight,
+            )
+
+        if _timings is not None:
+            _timings["postprocess"] = _time.perf_counter() - t2
+
+        return result
+
+    def _forward_raw(
+        self,
+        img_raw: np.ndarray,
+        mask_raw: np.ndarray,
+        input_is_linear: bool,
+        refiner_scale: float,
+        _timings: dict | None,
+    ) -> tuple[dict[str, torch.Tensor], bool, tuple]:
+        """Upload, preprocess on GPU, and run the forward pass.
+
+        Returns ``(model_output, use_cuda, timing_state)`` where
+        *timing_state* is an opaque tuple consumed by
+        :meth:`_finish_raw_timings`.
+        """
+        use_cuda = self.device.type == "cuda"
+        use_events = _timings is not None and use_cuda
+
+        if use_events:
+            ev_start, ev_preprocess, ev_forward, _ev_unused = self._ev_timing
+            ev_start.record(torch.cuda.current_stream(self.device))
+        elif _timings is not None:
+            import time as _time
+            t0 = _time.perf_counter()
+
+        # Upload raw decoded arrays to GPU
+        if not img_raw.flags['C_CONTIGUOUS']:
+            img_raw = np.ascontiguousarray(img_raw)
+        img_t = torch.from_numpy(img_raw).to(
+            device=self.device, dtype=torch.float32,
+        )
+        img_t = img_t.permute(2, 0, 1).unsqueeze(0)
+
+        if not mask_raw.flags['C_CONTIGUOUS']:
+            mask_raw = np.ascontiguousarray(mask_raw)
+        mask_t = torch.from_numpy(mask_raw).to(
+            device=self.device, dtype=torch.float32,
+        )
+        mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+
+        # Resize on GPU
+        img_t = F.interpolate(img_t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+        mask_t = F.interpolate(mask_t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+
+        if input_is_linear:
+            img_t = cu.linear_to_srgb(img_t)
+
+        img_t = (img_t - self._mean_t) / self._std_t
+
+        inp_t = torch.cat([img_t, mask_t], dim=1).contiguous()
+        inp_t = inp_t.to(dtype=self.config.model_dtype)
+
+        if use_events:
+            ev_preprocess.record(torch.cuda.current_stream(self.device))
+        elif _timings is not None:
+            t1 = _time.perf_counter()
+
+        # Forward pass
+        self._refiner_scale = refiner_scale
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.config.effective_mixed_precision,
+        ):
+            out = self.model(inp_t)
+
+        if use_events:
+            ev_forward.record(torch.cuda.current_stream(self.device))
+        elif _timings is not None:
+            t2 = _time.perf_counter()
+
+        # Build timing state for _finish_raw_timings
+        import time as _time_mod
+        t_post0 = _time_mod.perf_counter() if _timings is not None else 0
+
+        if use_events:
+            ts = ("events", ev_start, ev_preprocess, ev_forward, t_post0)
+        elif _timings is not None:
+            ts = ("perf", t0, t1, t2, t_post0)
+        else:
+            ts = None
+
+        return out, use_cuda, ts
+
+    @staticmethod
+    def _finish_raw_timings(_timings: dict | None, ts: tuple | None) -> None:
+        """Write timing entries from the state returned by _forward_raw."""
+        if _timings is None or ts is None:
+            return
+        import time as _time_mod
+        if ts[0] == "events":
+            _, ev_start, ev_preprocess, ev_forward, t_post0 = ts
+            _timings["preprocess"] = ev_start.elapsed_time(ev_preprocess) / 1000.0
+            _timings["forward"] = ev_preprocess.elapsed_time(ev_forward) / 1000.0
+            _timings["postprocess"] = _time_mod.perf_counter() - t_post0
+        else:
+            _, t0, t1, t2, t_post0 = ts
+            _timings["preprocess"] = t1 - t0
+            _timings["forward"] = t2 - t1
+            _timings["postprocess"] = _time_mod.perf_counter() - t_post0
+
+    @torch.inference_mode()
+    def process_raw(
+        self,
+        img_raw: np.ndarray,
+        mask_raw: np.ndarray,
+        orig_h: int,
+        orig_w: int,
+        input_is_linear: bool = False,
+        refiner_scale: float = 1.0,
+        fg_is_straight: bool = True,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+        _timings: dict | None = None,
+    ) -> dict[str, np.ndarray]:
+        """GPU-accelerated path: upload raw decoded frames and preprocess on device.
+
+        Moves resize, color space conversion, and normalization to GPU,
+        reducing CPU→GPU transfer size and eliminating CPU-bound preprocessing.
+        """
+        out, use_cuda, ts = self._forward_raw(
+            img_raw, mask_raw, input_is_linear, refiner_scale, _timings,
+        )
+
+        pred_alpha = out["alpha"]
+        pred_fg = out["fg"]
+
+        if use_cuda:
+            result = self._postprocess_gpu(
+                pred_alpha, pred_fg, orig_h, orig_w,
+                auto_despeckle, despeckle_size,
+                despill_strength, fg_is_straight,
+            )
+        else:
+            result = self._postprocess_cpu(
+                pred_alpha, pred_fg, orig_h, orig_w,
+                auto_despeckle, despeckle_size,
+                despill_strength, fg_is_straight,
+            )
+
+        self._finish_raw_timings(_timings, ts)
+        return result
+
+    @torch.inference_mode()
+    def process_raw_deferred(
+        self,
+        img_raw: np.ndarray,
+        mask_raw: np.ndarray,
+        orig_h: int,
+        orig_w: int,
+        input_is_linear: bool = False,
+        refiner_scale: float = 1.0,
+        fg_is_straight: bool = True,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+        _timings: dict | None = None,
+    ) -> PendingTransfer:
+        """Like :meth:`process_raw` but returns a :class:`PendingTransfer`.
+
+        The GPU→CPU DMA is started but not waited on.  Call
+        ``pending.resolve()`` to block until the transfer completes and
+        get the numpy dict.  This allows overlapping the DMA with the
+        next frame's preprocess + forward pass.
+        """
+        # Skip CUDA event timing — reading elapsed times requires
+        # synchronizing the forward event, which blocks the CPU thread
+        # and defeats the purpose of deferring.  The inference worker's
+        # profiler captures wall-clock timings independently.
+        out, use_cuda, ts = self._forward_raw(
+            img_raw, mask_raw, input_is_linear, refiner_scale, None,
+        )
+
+        pred_alpha = out["alpha"]
+        pred_fg = out["fg"]
+
+        if use_cuda:
+            pending = self._postprocess_gpu(
+                pred_alpha, pred_fg, orig_h, orig_w,
+                auto_despeckle, despeckle_size,
+                despill_strength, fg_is_straight,
+                sync=False,
+            )
+        else:
+            result = self._postprocess_cpu(
+                pred_alpha, pred_fg, orig_h, orig_w,
+                auto_despeckle, despeckle_size,
+                despill_strength, fg_is_straight,
+            )
+            pending = PendingTransfer(None, None, result)
+
+        self._finish_raw_timings(_timings, ts)
+        return pending
+
+    @torch.inference_mode()
+    def process_raw_batch(
+        self,
+        frames: list[tuple[np.ndarray, np.ndarray, int, int]],
+        input_is_linear: bool = False,
+        refiner_scale: float = 1.0,
+        fg_is_straight: bool = True,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+        _timings: dict | None = None,
+    ) -> list[dict[str, np.ndarray]]:
+        """Batched GPU inference: process multiple frames in one forward pass.
+
+        Parameters
+        ----------
+        frames : list of (img_raw, mask_raw, orig_h, orig_w)
+            Each element is a raw decoded frame pair at original resolution.
+        _timings : dict | None
+            If provided, per-stage times are written (amortized over batch).
+
+        Returns
+        -------
+        list of dicts, one per frame, each with "alpha", "fg", "comp", "processed".
+        """
+        import time as _time_mod
+
+        B = len(frames)
+        if B == 0:
+            return []
+
+        use_cuda = self.device.type == "cuda"
+        use_events = _timings is not None and use_cuda
+
+        if use_events:
+            ev_start, ev_preprocess, ev_forward, _ = self._ev_timing
+            ev_start.record(torch.cuda.current_stream(self.device))
+        elif _timings is not None:
+            t0 = _time_mod.perf_counter()
+
+        # === Preprocess: upload and resize each frame, then stack ===
+        # All frames go to GPU individually (each may have different orig
+        # resolution), then get resized to model size and stacked.
+        img_batch = []
+        mask_batch = []
+        orig_sizes = []
+        for img_raw, mask_raw, orig_h, orig_w in frames:
+            if not img_raw.flags['C_CONTIGUOUS']:
+                img_raw = np.ascontiguousarray(img_raw)
+            img_t = torch.from_numpy(img_raw).to(device=self.device, dtype=torch.float32)
+            img_t = img_t.permute(2, 0, 1).unsqueeze(0)
+
+            if not mask_raw.flags['C_CONTIGUOUS']:
+                mask_raw = np.ascontiguousarray(mask_raw)
+            mask_t = torch.from_numpy(mask_raw).to(device=self.device, dtype=torch.float32)
+            mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+
+            img_t = F.interpolate(img_t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+            mask_t = F.interpolate(mask_t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+
+            if input_is_linear:
+                img_t = cu.linear_to_srgb(img_t)
+
+            img_t = (img_t - self._mean_t) / self._std_t
+
+            img_batch.append(torch.cat([img_t, mask_t], dim=1))
+            orig_sizes.append((orig_h, orig_w))
+
+        # Single stack → one contiguous [B, 4, H, W] tensor for the model
+        inp_t = torch.cat(img_batch, dim=0).contiguous()
+
+        # Pad to fixed batch size so torch.compile only ever sees one shape
+        # (zero recompilation).  Padding frames are zeros — harmless through
+        # the model, and sliced off before postprocess.
+        target_B = self.max_batch_size()
+        if B < target_B:
+            padding = torch.zeros(
+                target_B - B, 4, self.img_size, self.img_size,
+                device=self.device, dtype=inp_t.dtype,
+            )
+            inp_t = torch.cat([inp_t, padding], dim=0)
+
+        inp_t = inp_t.to(dtype=self.config.model_dtype)
+
+        if use_events:
+            ev_preprocess.record(torch.cuda.current_stream(self.device))
+        elif _timings is not None:
+            t1 = _time_mod.perf_counter()
+
+        # === Forward: one pass for the entire (padded) batch ===
+        self._refiner_scale = refiner_scale
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.config.effective_mixed_precision,
+        ):
+            out = self.model(inp_t)
+
+        if use_events:
+            ev_forward.record(torch.cuda.current_stream(self.device))
+        elif _timings is not None:
+            t2 = _time_mod.perf_counter()
+
+        t_post0 = _time_mod.perf_counter() if _timings is not None else 0
+
+        # === Postprocess: slice to real frames, process individually ===
+        # Discard padding frames, then resize each independently (frames
+        # may have different original resolutions).
+        pred_alpha = out["alpha"][:B]  # [B, 1, model_h, model_w]
+        pred_fg = out["fg"][:B]        # [B, 3, model_h, model_w]
+
+        results = []
+        if use_cuda:
+            for i in range(B):
+                result = self._postprocess_gpu(
+                    pred_alpha[i:i+1], pred_fg[i:i+1],
+                    orig_sizes[i][0], orig_sizes[i][1],
+                    auto_despeckle, despeckle_size,
+                    despill_strength, fg_is_straight,
+                )
+                results.append(result)
+        else:
+            for i in range(B):
+                result = self._postprocess_cpu(
+                    pred_alpha[i:i+1], pred_fg[i:i+1],
+                    orig_sizes[i][0], orig_sizes[i][1],
+                    auto_despeckle, despeckle_size,
+                    despill_strength, fg_is_straight,
+                )
+                results.append(result)
+
+        # Extract timings (amortized over batch)
+        if use_events:
+            _timings["preprocess"] = ev_start.elapsed_time(ev_preprocess) / 1000.0
+            _timings["forward"] = ev_preprocess.elapsed_time(ev_forward) / 1000.0
+            _timings["postprocess"] = _time_mod.perf_counter() - t_post0
+        elif _timings is not None:
+            _timings["preprocess"] = t1 - t0
+            _timings["forward"] = t2 - t1
+            _timings["postprocess"] = _time_mod.perf_counter() - t2
+
+        return results
+
+    def max_batch_size(self) -> int:
+        """Return the frozen batch size computed at init time."""
+        return self._max_batch_size
+
+    def set_max_batch_size(self, size: int) -> None:
+        """Override the batch size (must be called before warmup/inference)."""
+        self._max_batch_size = size
+
+    def _compute_max_batch_size(self) -> int:
+        """Estimate max batch size based on available GPU memory.
+
+        Called once at init (right after model load, when VRAM is most
+        stable) and cached.  Must not be recomputed at runtime or
+        torch.compile will retrace for the new padded shape.
+
+        Conservative: uses 2 GB per frame estimate (activations + attention
+        buffers at 2048²) and 30% headroom.  Caps at 8 to avoid diminishing
+        returns from memory bandwidth saturation.
+        """
+        if self.device.type != "cuda":
+            return 1
+
+        free, _total = torch.cuda.mem_get_info(self.device)
+        # Per-frame activation memory at 2048²:
+        #   - Input tensor: 4 * 2048² * 4B = 64MB
+        #   - Attention buffers: ~1.5 GB (scales with sequence length²)
+        #   - Intermediate features: ~300 MB
+        # Total ~2 GB per frame in batch
+        per_frame_mb = 2048
+        available_mb = (free * 0.7) / (1024 ** 2)
+        batch = max(1, int(available_mb / per_frame_mb))
+        return min(batch, 8)  # cap at 8
+
+    def _postprocess_gpu(
+        self,
+        pred_alpha: torch.Tensor,
+        pred_fg: torch.Tensor,
+        h: int, w: int,
+        auto_despeckle: bool,
+        despeckle_size: int,
+        despill_strength: float,
+        fg_is_straight: bool,
+        sync: bool = True,
+    ) -> dict[str, np.ndarray] | PendingTransfer:
+        """Post-process on GPU, transfer final results to CPU.
+
+        When ``sync=True`` (default), blocks until transfer completes and
+        returns numpy arrays.  When ``sync=False``, starts the DMA
+        non-blocking and returns a :class:`PendingTransfer` — call
+        ``.resolve()`` to get the numpy dict later.
+        """
+        # Resize on GPU using F.interpolate (much faster than cv2 at 4K)
+        alpha_up = F.interpolate(pred_alpha.float(), size=(h, w), mode="bilinear", align_corners=False)
+        fg_up = F.interpolate(pred_fg.float(), size=(h, w), mode="bilinear", align_corners=False)
+
+        # Convert to HWC on GPU
+        res_alpha = alpha_up[0].permute(1, 2, 0)  # [H, W, 1]
+        res_fg = fg_up[0].permute(1, 2, 0)        # [H, W, 3]
+
+        # A. Clean matte
+        if auto_despeckle:
+            processed_alpha = self._clean_matte_gpu(res_alpha, despeckle_size, dilation=25, blur_size=5)
+        else:
+            processed_alpha = res_alpha
+
+        # B. Despill on GPU
+        fg_despilled = self._despill_gpu(res_fg, despill_strength)
+
+        # C. sRGB → linear on GPU
+        fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
+
+        # D. Premultiply on GPU
+        fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
+
+        # E. Pack RGBA on GPU
+        processed_rgba = torch.cat([fg_premul_lin, processed_alpha], dim=-1)
+
+        # F. Composite on checkerboard (GPU)
+        bg_srgb = self._get_checkerboard_gpu(w, h)
+        bg_lin = cu.srgb_to_linear(bg_srgb)
+
+        if fg_is_straight:
+            comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+        else:
+            comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+
+        comp_srgb = cu.linear_to_srgb(comp_lin)
+
+        # === Bulk transfer to CPU via copy stream ===
+        #
+        # Pack all outputs into one contiguous tensor, DMA to a pinned
+        # buffer on the copy stream.  Double-buffered: alternates between
+        # two pinned buffers so deferred DMA from frame N doesn't conflict
+        # with frame N+1's transfer.
+        #
+        # Layout: [H, W, 1+3+3+4] = [alpha, fg, comp, processed]
+        bulk = torch.cat([res_alpha, res_fg, comp_srgb, processed_rgba], dim=-1)
+
+        if self._copy_stream is not None:
+            # Select pinned buffer and toggle index for next call
+            idx = self._pinned_idx
+            self._pinned_idx = 1 - self._pinned_idx
+
+            # Reallocate this buffer slot if shape changed
+            if self._pinned_shapes[idx] != bulk.shape:
+                self._pinned_bufs[idx] = torch.empty(bulk.shape, dtype=bulk.dtype, pin_memory=True)
+                self._pinned_shapes[idx] = bulk.shape
+
+            pinned = self._pinned_bufs[idx]
+
+            # Wait for compute to finish, then async DMA on copy stream
+            event = torch.cuda.current_stream(self.device).record_event()
+            self._copy_stream.wait_event(event)
+            with torch.cuda.stream(self._copy_stream):
+                pinned.copy_(bulk, non_blocking=True)
+
+            if not sync:
+                return PendingTransfer(self._copy_stream, pinned, None)
+
+            # Sync path: block until DMA completes, return numpy with .copy()
+            self._copy_stream.synchronize()
+            bulk_np = pinned.numpy()
+            return {
+                "alpha": bulk_np[:, :, 0:1].copy(),
+                "fg": bulk_np[:, :, 1:4].copy(),
+                "comp": bulk_np[:, :, 4:7].copy(),
+                "processed": bulk_np[:, :, 7:11].copy(),
+            }
+        else:
+            bulk_np = bulk.cpu().numpy()
+            result = {
+                "alpha": bulk_np[:, :, 0:1],
+                "fg": bulk_np[:, :, 1:4],
+                "comp": bulk_np[:, :, 4:7],
+                "processed": bulk_np[:, :, 7:11],
+            }
+            if not sync:
+                return PendingTransfer(None, None, result)
+            return result
+
+    def _postprocess_cpu(
+        self,
+        pred_alpha: torch.Tensor,
+        pred_fg: torch.Tensor,
+        h: int, w: int,
+        auto_despeckle: bool,
+        despeckle_size: int,
+        despill_strength: float,
+        fg_is_straight: bool,
+    ) -> dict[str, np.ndarray]:
+        """CPU fallback post-processing (for non-CUDA devices)."""
+        res_alpha = pred_alpha[0].permute(1, 2, 0).float().cpu().numpy()
+        res_fg = pred_fg[0].permute(1, 2, 0).float().cpu().numpy()
+        res_alpha = cv2.resize(res_alpha, (w, h), interpolation=cv2.INTER_LANCZOS4)
+        res_fg = cv2.resize(res_fg, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+        if res_alpha.ndim == 2:
+            res_alpha = res_alpha[:, :, np.newaxis]
+
+        if auto_despeckle:
+            processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=25, blur_size=5)
+        else:
+            processed_alpha = res_alpha
+
+        fg_despilled = cu.despill(res_fg, green_limit_mode="average", strength=despill_strength)
+        fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
+        fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
+        processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
+
+        bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
+        bg_lin = cu.srgb_to_linear(bg_srgb)
+
+        if fg_is_straight:
+            comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+        else:
+            comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+
+        comp_srgb = cu.linear_to_srgb(comp_lin)
+
+        return {
             "alpha": res_alpha,
             "fg": res_fg,
             "comp": comp_srgb,
             "processed": processed_rgba,
         }
-
-        if metrics is not None:
-            result["metrics"] = metrics
-
-        return result
