@@ -35,3 +35,19 @@ def test_import_videomama():
 
 def test_import_videomama_inference():
     from VideoMaMaInferenceModule import inference  # noqa: F401
+
+
+def test_import_optimization_config():
+    from CorridorKeyModule.optimization_config import OptimizationConfig  # noqa: F401
+
+
+def test_import_base_engine():
+    from CorridorKeyModule.base_engine import _BaseCorridorKeyEngine  # noqa: F401
+
+
+def test_import_optimized_engine():
+    from CorridorKeyModule.optimized_engine import OptimizedCorridorKeyEngine  # noqa: F401
+
+
+def test_import_optimized_model():
+    from CorridorKeyModule.core.optimized_model import OptimizedGreenFormer  # noqa: F401

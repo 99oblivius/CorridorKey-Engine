@@ -19,7 +19,7 @@ MLX_EXT = ".safetensors"
 DEFAULT_IMG_SIZE = 2048
 
 BACKEND_ENV_VAR = "CORRIDORKEY_BACKEND"
-VALID_BACKENDS = ("auto", "torch", "mlx")
+VALID_BACKENDS = ("auto", "torch", "torch_optimized", "mlx")
 
 
 def resolve_backend(requested: str | None = None) -> str:
@@ -48,9 +48,24 @@ def resolve_backend(requested: str | None = None) -> str:
 
 
 def _auto_detect_backend() -> str:
-    """Try MLX on Apple Silicon, fall back to Torch."""
+    """Try MLX on Apple Silicon, torch_optimized on constrained GPUs, else torch."""
     if sys.platform != "darwin" or platform.machine() != "arm64":
-        logger.info("Not Apple Silicon — using torch backend")
+        # Check if we should default to torch_optimized on CUDA GPUs with <16GB
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if total_mem_gb < 16:
+                    logger.info(
+                        "GPU has %.1f GB VRAM (<16 GB) — using torch_optimized backend",
+                        total_mem_gb,
+                    )
+                    return "torch_optimized"
+        except (ImportError, RuntimeError):
+            pass
+
+        logger.info("Using torch backend")
         return "torch"
 
     try:
@@ -206,8 +221,18 @@ def create_engine(
     backend: str | None = None,
     device: str | None = None,
     img_size: int = DEFAULT_IMG_SIZE,
+    optimization_config=None,
 ):
-    """Factory: returns an engine with process_frame() matching the Torch contract."""
+    """Factory: returns an engine with process_frame() matching the Torch contract.
+
+    Args:
+        backend: Backend name (auto/torch/torch_optimized/mlx).
+        device: Torch device string (e.g. "cuda", "cpu").
+        img_size: Model input resolution.
+        optimization_config: Optional :class:`OptimizationConfig` to pass
+            through to the engine.  When ``None``, each backend uses its
+            own default profile.
+    """
     backend = resolve_backend(backend)
 
     if backend == "mlx":
@@ -217,9 +242,25 @@ def create_engine(
         raw_engine = CorridorKeyMLXEngine(str(ckpt), img_size=img_size)
         logger.info("MLX engine loaded: %s", ckpt.name)
         return _MLXEngineAdapter(raw_engine)
+    elif backend == "torch_optimized":
+        ckpt = _discover_checkpoint(TORCH_EXT)
+        from CorridorKeyModule.optimized_engine import OptimizedCorridorKeyEngine
+
+        logger.info("Optimized Torch engine loaded: %s (device=%s)", ckpt.name, device)
+        return OptimizedCorridorKeyEngine(
+            checkpoint_path=str(ckpt),
+            device=device or "cpu",
+            img_size=img_size,
+            optimization_config=optimization_config,
+        )
     else:
         ckpt = _discover_checkpoint(TORCH_EXT)
         from CorridorKeyModule.inference_engine import CorridorKeyEngine
 
         logger.info("Torch engine loaded: %s (device=%s)", ckpt.name, device)
-        return CorridorKeyEngine(checkpoint_path=str(ckpt), device=device or "cpu", img_size=img_size)
+        return CorridorKeyEngine(
+            checkpoint_path=str(ckpt),
+            device=device or "cpu",
+            img_size=img_size,
+            optimization_config=optimization_config,
+        )

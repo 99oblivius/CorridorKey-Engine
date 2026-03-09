@@ -556,7 +556,7 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
             traceback.print_exc()
 
 
-def run_inference(clips, device=None, backend=None, max_frames=None):
+def run_inference(clips, device=None, backend=None, max_frames=None, optimization_config=None):
     ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
 
     if not ready_clips:
@@ -627,7 +627,7 @@ def run_inference(clips, device=None, backend=None, max_frames=None):
         device = resolve_device()
     from CorridorKeyModule.backend import create_engine
 
-    engine = create_engine(backend=backend, device=device)
+    engine = create_engine(backend=backend, device=device, optimization_config=optimization_config)
 
     for clip in ready_clips:
         logger.info(f"Running Inference on: {clip.name}")

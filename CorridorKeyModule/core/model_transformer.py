@@ -5,6 +5,55 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..optimization_config import OptimizationConfig
+
+# ---------------------------------------------------------------------------
+# Shared utility: patch input layer for non-3-channel inputs
+# ---------------------------------------------------------------------------
+
+
+def patch_input_layer(encoder: nn.Module, in_channels: int) -> None:
+    """Modify the first convolution layer to accept *in_channels*.
+
+    Copies existing RGB weights and zero-initialises the extra channels.
+    Works with timm Hiera models (tries ``encoder.model.patch_embed.proj``
+    first, then ``encoder.patch_embed.proj``).
+    """
+    try:
+        proj = encoder.model.patch_embed.proj
+    except AttributeError:
+        proj = encoder.patch_embed.proj
+
+    weight = proj.weight.data  # [Out, 3, K, K]
+    bias = proj.bias.data if proj.bias is not None else None
+    out_channels, _, k, _ = weight.shape
+
+    new_conv = nn.Conv2d(
+        in_channels,
+        out_channels,
+        kernel_size=k,
+        stride=proj.stride,
+        padding=proj.padding,
+        bias=(bias is not None),
+    )
+
+    new_conv.weight.data[:, :3, :, :] = weight
+    new_conv.weight.data[:, 3:, :, :] = 0.0
+    if bias is not None:
+        new_conv.bias.data = bias
+
+    try:
+        encoder.model.patch_embed.proj = new_conv
+    except AttributeError:
+        encoder.patch_embed.proj = new_conv
+
+    print(f"Patched input layer: 3 channels -> {in_channels} channels (Extra initialized to 0)")
+
+
+# ---------------------------------------------------------------------------
+# Building blocks
+# ---------------------------------------------------------------------------
+
 
 class MLP(nn.Module):
     """Linear embedding: C_in -> C_out."""
@@ -68,9 +117,7 @@ class DecoderHead(nn.Module):
 
 
 class RefinerBlock(nn.Module):
-    """
-    Residual Block with Dilation and GroupNorm (Safe for Batch Size 2).
-    """
+    """Residual Block with Dilation and GroupNorm (Safe for Batch Size 2)."""
 
     def __init__(self, channels: int, dilation: int = 1) -> None:
         super().__init__()
@@ -93,9 +140,9 @@ class RefinerBlock(nn.Module):
 
 
 class CNNRefinerModule(nn.Module):
-    """
-    Dilated Residual Refiner (Receptive Field ~65px).
-    designed to solve Macroblocking artifacts from Hiera.
+    """Dilated Residual Refiner (Receptive Field ~65px).
+
+    Designed to solve Macroblocking artifacts from Hiera.
     Structure: Stem -> Res(d1) -> Res(d2) -> Res(d4) -> Res(d8) -> Projection.
     """
 
@@ -138,156 +185,169 @@ class CNNRefinerModule(nn.Module):
         return self.final(x) * 10.0
 
 
+# ---------------------------------------------------------------------------
+# GreenFormer
+# ---------------------------------------------------------------------------
+
+
 class GreenFormer(nn.Module):
+    """Hiera-based green screen keying model.
+
+    Accepts an optional :class:`OptimizationConfig` to selectively apply
+    VRAM optimizations (FlashAttention patching, tiled refiner, cache
+    clearing).  When *optimization_config* is ``None``, behaviour is
+    identical to the original unoptimized model.
+    """
+
     def __init__(
         self,
         encoder_name: str = "hiera_base_plus_224.mae_in1k_ft_in1k",
         in_channels: int = 4,
         img_size: int = 512,
         use_refiner: bool = True,
+        optimization_config: OptimizationConfig | None = None,
     ) -> None:
         super().__init__()
+        self.config = optimization_config or OptimizationConfig()
+        self.img_size = img_size
+        self.in_channels = in_channels
 
         # --- Encoder ---
-        # Load Pretrained Hiera
-        # 1. Create Target Model (512x512, Random Weights)
-        # We use features_only=True, which wraps it in FeatureGetterNet
         print(f"Initializing {encoder_name} (img_size={img_size})...")
         self.encoder = timm.create_model(encoder_name, pretrained=False, features_only=True, img_size=img_size)
-        # We skip downloading/loading base weights because the user's checkpoint
-        # (loaded immediately after this) contains all weights, including correctly
-        # trained/sized PosEmbeds. This keeps the project offline-capable using only local assets.
         print("Skipped downloading base weights (relying on custom checkpoint).")
 
-        # Patch First Layer for 4 channels
+        # Patch first layer for 4 channels
         if in_channels != 3:
-            self._patch_input_layer(in_channels)
+            patch_input_layer(self.encoder, in_channels)
+
+        # FlashAttention patching (conditional)
+        if self.config.flash_attention:
+            from .optimized_model import _patch_hiera_global_attention
+
+            n_patched = _patch_hiera_global_attention(self.encoder.model)
+            if n_patched:
+                print(f"[Optimized] Patched {n_patched} global-attention blocks for FlashAttention.")
 
         # Get feature info
-        # Verified Hiera Base Plus channels: [112, 224, 448, 896]
-        # We can try to fetch dynamically
         try:
             feature_channels = self.encoder.feature_info.channels()
         except (AttributeError, TypeError):
             feature_channels = [112, 224, 448, 896]
         print(f"Feature Channels: {feature_channels}")
+        self._feature_channels = feature_channels
+
+        # --- Hiera internals (needed by subclass for token routing) ---
+        hiera = self.encoder.model
+        self._stage_ends = list(hiera.stage_ends)
+        self._patch_stride = hiera.patch_stride
+
+        tokens_h = img_size // self._patch_stride[0]
+        tokens_w = img_size // self._patch_stride[1]
+        self._stage_token_shapes: list[tuple[int, int]] = []
+        for i in range(len(self._stage_ends)):
+            self._stage_token_shapes.append((tokens_h, tokens_w))
+            if i < hiera.q_pool:
+                tokens_h //= hiera.q_stride[0]
+                tokens_w //= hiera.q_stride[1]
 
         # --- Decoders ---
         embedding_dim = 256
-
-        # Alpha Decoder (Outputs 1 channel)
         self.alpha_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=1)
-
-        # Foreground Decoder (Outputs 3 channels)
         self.fg_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=3)
 
         # --- Refiner ---
-        # CNN Refiner
-        # In Channels: 3 (RGB) + 4 (Coarse Pred) = 7
         self.use_refiner = use_refiner
         if self.use_refiner:
-            self.refiner = CNNRefinerModule(in_channels=7, hidden_channels=64, out_channels=4)
+            if self.config.tiled_refiner:
+                from .optimized_model import TiledCNNRefiner
+
+                self.refiner = TiledCNNRefiner(
+                    in_channels=7,
+                    hidden_channels=64,
+                    out_channels=4,
+                    tile_size=self.config.tile_size,
+                    tile_overlap=self.config.tile_overlap,
+                )
+                print(
+                    f"[Optimized] Using TiledCNNRefiner "
+                    f"(tile={self.config.tile_size}, overlap={self.config.tile_overlap})."
+                )
+            else:
+                self.refiner = CNNRefinerModule(in_channels=7, hidden_channels=64, out_channels=4)
         else:
             self.refiner = None
             print("Refiner Module DISABLED (Backbone Only Mode).")
 
+    # kept for backward compat; delegates to the module-level function
     def _patch_input_layer(self, in_channels: int) -> None:
+        patch_input_layer(self.encoder, in_channels)
+
+    # ------------------------------------------------------------------
+    # Decode + Refine pipeline (shared with subclasses)
+    # ------------------------------------------------------------------
+
+    def _decode_and_refine(
+        self,
+        features: list[torch.Tensor],
+        x: torch.Tensor,
+        input_size: tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+        """Shared decode -> upsample -> sigmoid -> refine -> sigmoid.
+
+        Called by :meth:`forward` and overridden encoder paths in
+        ``OptimizedGreenFormer``.
         """
-        Modifies the first convolution layer to accept `in_channels`.
-        Copies existing RGB weights and initializes extras to zero.
-        """
-        # Hiera: self.encoder.model.patch_embed.proj
+        # Decode
+        alpha_logits = self.alpha_decoder(features)
+        fg_logits = self.fg_decoder(features)
 
-        try:
-            patch_embed = self.encoder.model.patch_embed.proj
-        except AttributeError:
-            # Fallback if timm changes structure or for other models
-            patch_embed = self.encoder.patch_embed.proj
-        weight = patch_embed.weight.data  # [Out, 3, K, K]
-        bias = patch_embed.bias.data if patch_embed.bias is not None else None
-
-        new_in_channels = in_channels
-        out_channels, _, k, k = weight.shape
-
-        # Create new conv
-        new_conv = nn.Conv2d(
-            new_in_channels,
-            out_channels,
-            kernel_size=k,
-            stride=patch_embed.stride,
-            padding=patch_embed.padding,
-            bias=(bias is not None),
-        )
-
-        # Copy weights
-        new_conv.weight.data[:, :3, :, :] = weight
-        # Initialize new channels to 0 (Weight Patching)
-        new_conv.weight.data[:, 3:, :, :] = 0.0
-
-        if bias is not None:
-            new_conv.bias.data = bias
-
-        # Replace in module
-        try:
-            self.encoder.model.patch_embed.proj = new_conv
-        except AttributeError:
-            self.encoder.patch_embed.proj = new_conv
-
-        print(f"Patched input layer: 3 channels -> {in_channels} channels (Extra initialized to 0)")
-
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        # x: [B, 4, H, W]
-        input_size = x.shape[2:]
-
-        # Encode
-        features = self.encoder(x)  # Returns list of features
-
-        # Decode Streams
-        alpha_logits = self.alpha_decoder(features)  # [B, 1, H/4, W/4]
-        fg_logits = self.fg_decoder(features)  # [B, 3, H/4, W/4]
-
-        # Upsample to full resolution (Bilinear)
-        # These are the "Coarse" LOGITS
+        # Upsample to full resolution
         alpha_logits_up = F.interpolate(alpha_logits, size=input_size, mode="bilinear", align_corners=False)
         fg_logits_up = F.interpolate(fg_logits, size=input_size, mode="bilinear", align_corners=False)
 
-        # --- HUMILITY CLAMP REMOVED (Phase 3) ---
-        # User requested NO CLAMPING to preserve all backbone detail.
-        # Refiner sees raw logits (-inf to +inf).
-        # alpha_logits_up = torch.clamp(alpha_logits_up, -3.0, 3.0)
-        # fg_logits_up = torch.clamp(fg_logits_up, -3.0, 3.0)
-
-        # Coarse Probs (for Loss and Refiner Input)
+        # Coarse probs (for refiner input)
         alpha_coarse = torch.sigmoid(alpha_logits_up)
         fg_coarse = torch.sigmoid(fg_logits_up)
 
-        # --- Refinement (CNN Hybrid) ---
-        # 4. Refine (CNN)
-        # Input to refiner: RGB Image (first 3 channels of x) + Coarse Predictions (Probs)
-        # We give the refiner 'Probs' as input features because they are normalized [0,1]
+        # Cache clearing before refiner
+        if self.config.cache_clearing and x.is_cuda:
+            torch.cuda.empty_cache()
+
+        # Refine
         rgb = x[:, :3, :, :]
+        coarse_pred = torch.cat([alpha_coarse, fg_coarse], dim=1)
 
-        # Feed the Refiner
-        coarse_pred = torch.cat([alpha_coarse, fg_coarse], dim=1)  # [B, 4, H, W]
-
-        # Refiner outputs DELTA LOGITS
-        # The refiner predicts the correction in valid score space (-inf, inf)
         if self.use_refiner and self.refiner is not None:
             delta_logits = self.refiner(rgb, coarse_pred)
         else:
-            # Zero Deltas
             delta_logits = torch.zeros_like(coarse_pred)
 
         delta_alpha = delta_logits[:, 0:1]
         delta_fg = delta_logits[:, 1:4]
 
-        # Residual Addition in Logit Space
-        # This allows infinite correction capability and prevents saturation blocking
+        # Residual addition in logit space
         alpha_final_logits = alpha_logits_up + delta_alpha
         fg_final_logits = fg_logits_up + delta_fg
 
-        # Final Activation
+        # Final activation
         alpha_final = torch.sigmoid(alpha_final_logits)
         fg_final = torch.sigmoid(fg_final_logits)
 
         return {"alpha": alpha_final, "fg": fg_final}
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        input_size = x.shape[2:]
+
+        # Encode
+        features = self.encoder(x)
+
+        # Cache clearing between encoder and decoder
+        if self.config.cache_clearing and x.is_cuda:
+            torch.cuda.empty_cache()
+
+        return self._decode_and_refine(features, x, input_size)

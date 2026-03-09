@@ -45,3 +45,12 @@ VideoMaMaInferenceModule/checkpoints/*
 !VideoMaMaInferenceModule/checkpoints/.gitkeep
 gvm_core/weights/*
 !gvm_core/weights/.gitkeep
+
+# Test footage & generated data (downloaded/generated locally)
+tears_of_steel_test/frames/
+tears_of_steel_test/alpha_hints/
+tears_of_steel_test/*.exr
+tears_of_steel_test/*.png
+*.mp4
+.omc/
+.sisyphus/

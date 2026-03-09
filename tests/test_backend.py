@@ -36,7 +36,10 @@ class TestResolveBackend:
     def test_auto_non_darwin(self):
         with mock.patch("CorridorKeyModule.backend.sys") as mock_sys:
             mock_sys.platform = "linux"
-            assert resolve_backend("auto") == "torch"
+            result = resolve_backend("auto")
+            # On non-Apple-Silicon, auto picks torch or torch_optimized
+            # depending on GPU VRAM availability
+            assert result in ("torch", "torch_optimized")
 
     def test_auto_darwin_no_mlx_package(self):
         with (

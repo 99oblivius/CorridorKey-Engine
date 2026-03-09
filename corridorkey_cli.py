@@ -311,11 +311,46 @@ def main() -> None:
         default="auto",
         help="Compute device (default: auto-detect CUDA > MPS > CPU)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "torch", "torch_optimized", "mlx"],
+        default="auto",
+        help="Inference backend (default: auto). torch_optimized uses tiled "
+        "refiner and memory hygiene to reduce VRAM from ~22.7GB to <8GB.",
+    )
+
+    # --- Optimization profile & per-optimization flags ---
+    parser.add_argument(
+        "--profile",
+        choices=["original", "optimized", "experimental"],
+        default=None,
+        help="Optimization profile (default: inferred from --backend). "
+        "Per-optimization flags below override profile settings.",
+    )
+    parser.add_argument("--flash-attention", action="store_true", default=None, help="Enable FlashAttention patching")
+    parser.add_argument("--no-flash-attention", dest="flash_attention", action="store_false")
+    parser.add_argument("--tiled-refiner", action="store_true", default=None, help="Enable tiled CNN refiner")
+    parser.add_argument("--no-tiled-refiner", dest="tiled_refiner", action="store_false")
+    parser.add_argument("--cache-clearing", action="store_true", default=None, help="Enable CUDA cache clearing")
+    parser.add_argument("--no-cache-clearing", dest="cache_clearing", action="store_false")
+    parser.add_argument("--disable-cudnn-benchmark", action="store_true", default=None, help="Disable cuDNN benchmark")
+    parser.add_argument("--no-disable-cudnn-benchmark", dest="disable_cudnn_benchmark", action="store_false")
+    parser.add_argument("--token-routing", action="store_true", default=None, help="Enable experimental token routing")
+    parser.add_argument("--no-token-routing", dest="token_routing", action="store_false")
+    parser.add_argument("--tile-size", type=int, default=None, help="Tile size for tiled refiner (default: 512)")
+    parser.add_argument("--tile-overlap", type=int, default=None, help="Tile overlap in pixels (default: 128)")
+    parser.add_argument("--metrics", action="store_true", default=False, help="Enable per-stage performance metrics")
 
     args = parser.parse_args()
 
     device = resolve_device(args.device)
-    logger.info(f"Using device: {device}")
+    backend = args.backend
+    logger.info(f"Using device: {device}, backend: {backend}")
+
+    # Build OptimizationConfig from profile + overrides
+    optimization_config = _build_optimization_config(args)
+    if optimization_config is not None:
+        logger.info(optimization_config.summary())
 
     try:
         if args.action == "list":
@@ -328,7 +363,7 @@ def main() -> None:
             generate_alphas_birefnet(clips, device=device)
         elif args.action == "run_inference":
             clips = scan_clips()
-            run_inference(clips, device=device)
+            run_inference(clips, device=device, backend=backend, optimization_config=optimization_config)
         elif args.action == "wizard":
             if not args.win_path:
                 print("Error: --win_path required for wizard.")
@@ -340,6 +375,69 @@ def main() -> None:
     except Exception as e:
         logger.error(str(e))
         sys.exit(1)
+
+
+def _build_optimization_config(args):
+    """Build an OptimizationConfig from CLI args.
+
+    Returns None if no profile or optimization flags were specified
+    (let the backend factory pick its own default).
+    """
+    from dataclasses import replace
+
+    from CorridorKeyModule.optimization_config import OptimizationConfig
+
+    # Determine base config from profile or backend
+    if args.profile:
+        config = OptimizationConfig.from_profile(args.profile)
+    elif args.backend == "torch_optimized":
+        config = OptimizationConfig.optimized()
+    elif args.backend == "torch":
+        config = OptimizationConfig.original()
+    else:
+        # Check if any override flags were set
+        has_overrides = (
+            any(
+                getattr(args, attr, None) is not None
+                for attr in (
+                    "flash_attention",
+                    "tiled_refiner",
+                    "cache_clearing",
+                    "disable_cudnn_benchmark",
+                    "token_routing",
+                    "tile_size",
+                    "tile_overlap",
+                )
+            )
+            or args.metrics
+        )
+        if not has_overrides:
+            return None
+        config = OptimizationConfig()
+
+    # Apply per-flag overrides
+    overrides = {}
+    if args.flash_attention is not None:
+        overrides["flash_attention"] = args.flash_attention
+    if args.tiled_refiner is not None:
+        overrides["tiled_refiner"] = args.tiled_refiner
+    if args.cache_clearing is not None:
+        overrides["cache_clearing"] = args.cache_clearing
+    if args.disable_cudnn_benchmark is not None:
+        overrides["disable_cudnn_benchmark"] = args.disable_cudnn_benchmark
+    if args.token_routing is not None:
+        overrides["token_routing"] = args.token_routing
+    if args.tile_size is not None:
+        overrides["tile_size"] = args.tile_size
+    if args.tile_overlap is not None:
+        overrides["tile_overlap"] = args.tile_overlap
+    if args.metrics:
+        overrides["enable_metrics"] = True
+
+    if overrides:
+        config = replace(config, **overrides)
+
+    return config
 
 
 if __name__ == "__main__":

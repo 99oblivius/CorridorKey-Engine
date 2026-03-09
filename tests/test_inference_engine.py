@@ -28,12 +28,14 @@ def _make_engine_with_mock(mock_greenformer, img_size=64):
     need for checkpoint files or GPU.
     """
     from CorridorKeyModule.inference_engine import CorridorKeyEngine
+    from CorridorKeyModule.optimization_config import OptimizationConfig
 
     engine = object.__new__(CorridorKeyEngine)
     engine.device = torch.device("cpu")
     engine.img_size = img_size
     engine.checkpoint_path = "/fake/checkpoint.pth"
     engine.use_refiner = False
+    engine.config = OptimizationConfig()
     engine.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
     engine.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
     engine.model = mock_greenformer
