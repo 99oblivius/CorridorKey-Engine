@@ -3,7 +3,6 @@
 
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-LOCAL_SCRIPT="$SCRIPT_DIR/corridorkey_cli.py"
 
 # SAFETY CHECK: Ensure a folder was provided as an argument
 if [ -z "$1" ]; then
@@ -29,7 +28,8 @@ TARGET_PATH="${TARGET_PATH%/}"
 echo "Starting Corridor Key locally..."
 echo "Target: $TARGET_PATH"
 
-# Run the python script via uv (handles the virtual environment automatically)
-uv run python "$LOCAL_SCRIPT" --action wizard --win_path "$TARGET_PATH"
+# Run via uv (handles the virtual environment automatically)
+cd "$SCRIPT_DIR"
+uv run corridorkey wizard "$TARGET_PATH"
 
 read -p "Press enter to close..."
