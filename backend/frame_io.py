@@ -11,10 +11,13 @@ _load_frames_for_videomama, _load_mask_frames_for_videomama).
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from .validators import normalize_mask_channels, normalize_mask_dtype
 
@@ -52,12 +55,11 @@ def read_image_frame(fpath: str, gamma_correct_exr: bool = False) -> np.ndarray 
         if gamma_correct_exr:
             result = np.power(result, 1.0 / 2.2).astype(np.float32)
         return result
-    else:
-        img = cv2.imread(fpath)
-        if img is None:
-            return None
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img_rgb.astype(np.float32) / 255.0
+    img = cv2.imread(fpath)
+    if img is None:
+        return None
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img_rgb.astype(np.float32) / 255.0
 
 
 def read_video_frame_at(

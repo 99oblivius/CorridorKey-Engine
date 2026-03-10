@@ -16,17 +16,17 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import cv2
-import time
-
 import numpy as np
 import torch
 
@@ -36,40 +36,132 @@ logger = logging.getLogger(__name__)
 _SHUTDOWN = object()
 
 
+class _TimelineProfiler:
+    """Thread-safe timeline profiler that records span events across all workers.
 
-class _StageProfiler:
-    """Lightweight per-GPU stage profiler.
-
-    Tracks cumulative time and idle time for each stage of the inference
-    worker (queue wait, tensor upload, inference, postprocess, write submit).
-    Printed as a summary at the end of the run.
+    Each event is a (timestamp, thread/device, stage, start/end, frame_index)
+    tuple.  At the end of a run, produces:
+      - A CSV file with one row per event for offline analysis
+      - Console summary with p50 fps, phase durations, per-GPU stats
     """
 
-    def __init__(self, device_str: str):
-        self.device = device_str
-        self.counts: dict[str, int] = {}
-        self.totals: dict[str, float] = {}
-        self._t0: float = 0.0
+    def __init__(self, t0: float) -> None:
+        self._t0 = t0  # pipeline epoch — all timestamps relative to this
+        self._events: list[tuple[float, str, str, str, int]] = []
+        self._lock = threading.Lock()
+        # Per-frame completion timestamps for fps calculation
+        self._frame_done_times: list[float] = []
 
-    def begin(self, stage: str) -> None:
-        self._t0 = time.perf_counter()
+    def span_begin(self, worker: str, stage: str, frame_idx: int = -1) -> float:
+        """Record the start of a span.  Returns the timestamp for pairing."""
+        t = time.perf_counter()
+        with self._lock:
+            self._events.append((t - self._t0, worker, stage, "begin", frame_idx))
+        return t
 
-    def end(self, stage: str) -> None:
-        elapsed = time.perf_counter() - self._t0
-        self.totals[stage] = self.totals.get(stage, 0.0) + elapsed
-        self.counts[stage] = self.counts.get(stage, 0) + 1
+    def span_end(self, worker: str, stage: str, t_begin: float, frame_idx: int = -1) -> None:
+        """Record the end of a span."""
+        t = time.perf_counter()
+        with self._lock:
+            self._events.append((t - self._t0, worker, stage, "end", frame_idx))
 
-    def summary(self) -> str:
-        lines = [f"  Pipeline profile for {self.device}:"]
-        total = sum(self.totals.values())
-        for stage, t in self.totals.items():
-            n = self.counts.get(stage, 0)
-            avg_ms = (t / n * 1000) if n > 0 else 0
-            pct = (t / total * 100) if total > 0 else 0
-            lines.append(f"    {stage:20s}: {t:7.2f}s total | {avg_ms:7.1f}ms avg | {pct:5.1f}%  ({n} calls)")
-        lines.append(f"    {'TOTAL':20s}: {total:7.2f}s")
+    def mark(self, worker: str, event_name: str, frame_idx: int = -1) -> None:
+        """Record a point event (no duration)."""
+        t = time.perf_counter()
+        with self._lock:
+            self._events.append((t - self._t0, worker, event_name, "mark", frame_idx))
+
+    def frame_completed(self) -> None:
+        """Record that a frame has been fully written to disk."""
+        with self._lock:
+            self._frame_done_times.append(time.perf_counter())
+
+    def write_csv(self, path: str) -> None:
+        """Write all events to a CSV file for offline analysis."""
+        import csv
+
+        with self._lock:
+            events = sorted(self._events, key=lambda e: e[0])
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["time_s", "worker", "stage", "type", "frame_idx"])
+            for row in events:
+                w.writerow(row)
+
+    def console_summary(
+        self,
+        num_frames: int,
+        total_wall: float,
+        warmup_time: float,
+        read_wall: float,
+        infer_wall: float,
+        write_drain: float,
+    ) -> str:
+        """Produce concise console summary."""
+        with self._lock:
+            done_times = sorted(self._frame_done_times)
+
+        # P50 fps: median inter-frame interval during steady-state processing
+        fps_str = "n/a"
+        if len(done_times) > 2:
+            intervals = [done_times[i + 1] - done_times[i] for i in range(len(done_times) - 1)]
+            intervals.sort()
+            # Take upper 50th percentile (slower half) for conservative estimate
+            mid = len(intervals) // 2
+            upper_half = intervals[mid:]
+            if upper_half:
+                median_interval = upper_half[len(upper_half) // 2]
+                fps_str = f"{1.0 / median_interval:.2f}"
+
+        lines = [
+            "",
+            f"  Warmup + compile : {warmup_time:7.2f}s",
+            f"  Read phase       : {read_wall:7.2f}s",
+            f"  Inference phase  : {infer_wall:7.2f}s",
+            f"  Write drain      : {write_drain:7.2f}s",
+            f"  Total            : {total_wall:7.2f}s",
+            f"  Frames           : {num_frames}",
+            f"  Throughput       : {num_frames / total_wall:.2f} fps (overall)  |  {fps_str} fps (p50 sustained)",
+        ]
+
+        # Per-GPU stats from events
+        gpu_stats = self._per_worker_stats()
+        for worker, stats in sorted(gpu_stats.items()):
+            if not worker.startswith("gpu:"):
+                continue
+            forward_avg = stats.get("forward", (0, 0))
+            queue_avg = stats.get("queue_wait", (0, 0))
+            n_frames = max(forward_avg[1], 1)
+            lines.append(
+                f"  {worker:14s}  : {n_frames} frames | "
+                f"forward {forward_avg[0] / n_frames * 1000:.0f}ms avg | "
+                f"idle {queue_avg[0] / max(queue_avg[1], 1) * 1000:.0f}ms avg"
+            )
+
         return "\n".join(lines)
 
+    def _per_worker_stats(self) -> dict[str, dict[str, tuple[float, int]]]:
+        """Aggregate total time and count per (worker, stage) from span pairs."""
+        with self._lock:
+            events = list(self._events)
+
+        # Match begin/end pairs
+        open_spans: dict[tuple[str, str, int], float] = {}  # (worker, stage, frame) -> begin_time
+        stats: dict[str, dict[str, tuple[float, int]]] = {}  # worker -> stage -> (total_s, count)
+
+        for t, worker, stage, typ, frame_idx in events:
+            if typ == "begin":
+                open_spans[(worker, stage, frame_idx)] = t
+            elif typ == "end":
+                key = (worker, stage, frame_idx)
+                if key in open_spans:
+                    elapsed = t - open_spans.pop(key)
+                    if worker not in stats:
+                        stats[worker] = {}
+                    prev = stats[worker].get(stage, (0.0, 0))
+                    stats[worker][stage] = (prev[0] + elapsed, prev[1] + 1)
+
+        return stats
 
 
 @dataclasses.dataclass
@@ -129,9 +221,9 @@ def _is_image_file(filename: str) -> bool:
     return filename.lower().endswith((".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".bmp"))
 
 
-
 def _read_input_frame(
-    path: str, is_exr: bool,
+    path: str,
+    is_exr: bool,
 ) -> np.ndarray | None:
     """Read and normalize a single input frame to float32 (H,W,3) 0-1."""
     if is_exr:
@@ -144,12 +236,11 @@ def _read_input_frame(
         elif img.shape[2] == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    else:
-        img = cv2.imread(path)
-        if img is None:
-            return None
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img_rgb.astype(np.float32) / 255.0
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img_rgb.astype(np.float32) / 255.0
 
 
 def _read_alpha_frame(path: str) -> np.ndarray | None:
@@ -168,10 +259,9 @@ def _read_alpha_frame(path: str) -> np.ndarray | None:
 
     if mask.dtype == np.uint8:
         return mask.astype(np.float32) / 255.0
-    elif mask.dtype == np.uint16:
+    if mask.dtype == np.uint16:
         return mask.astype(np.float32) / 65535.0
-    else:
-        return mask.astype(np.float32)
+    return mask.astype(np.float32)
 
 
 def _read_frame_pair(
@@ -279,6 +369,7 @@ class AsyncInferencePipeline:
         self.config = config
         self.engines: list[tuple[str, Any]] = []  # (device_str, engine)
         self._shutdown_event = threading.Event()
+        self._warmup_time: float = 0.0  # set by load_engines
 
     def _warmup_engines(self) -> None:
         """Run a dummy forward pass on each engine to trigger torch.compile.
@@ -296,11 +387,16 @@ class AsyncInferencePipeline:
             logger.info("Compiling kernels for %s...", dev_str)
             dummy = np.zeros((self.config.img_size, self.config.img_size, 4), dtype=np.float32)
             t0 = time.perf_counter()
-            try:
+            with contextlib.suppress(Exception):
                 engine.process_prepared(dummy, self.config.img_size, self.config.img_size)
-            except Exception:
-                pass
             logger.info("Kernel compilation for %s done in %.1fs", dev_str, time.perf_counter() - t0)
+
+            # Capture CUDA graph after torch.compile warmup if requested
+            if engine.config.cuda_graphs and engine._cuda_graph is None:
+                try:
+                    engine.capture_cuda_graph()
+                except Exception as e:
+                    logger.warning("CUDA graph capture failed on %s: %s", dev_str, e)
 
         cuda_engines = [(d, e) for d, e in self.engines if d.startswith("cuda")]
         if not cuda_engines:
@@ -345,7 +441,10 @@ class AsyncInferencePipeline:
                     free, total = torch.cuda.mem_get_info(i)
                     logger.info(
                         "GPU %d (%s): %.0f MB free / %.0f MB total",
-                        i, name, free / (1024 * 1024), total / (1024 * 1024),
+                        i,
+                        name,
+                        free / (1024 * 1024),
+                        total / (1024 * 1024),
                     )
                     devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
 
@@ -354,6 +453,7 @@ class AsyncInferencePipeline:
                     devices = ["cpu"]
 
         logger.info("Loading engines on devices: %s", devices)
+        t_load0 = time.perf_counter()
         for dev in devices:
             engine = create_engine(
                 backend=self.config.backend,
@@ -365,6 +465,7 @@ class AsyncInferencePipeline:
             logger.info("Engine loaded on %s", dev)
 
         self._warmup_engines()
+        self._warmup_time = time.perf_counter() - t_load0
 
     def process_clip(
         self,
@@ -437,13 +538,20 @@ class AsyncInferencePipeline:
             # total across GPUs (done below).
             num_writers = max(4, cores - num_readers)
 
-        logger.info("Worker pool: %d readers, %d writers (%d cores, %d GPUs)",
-                     num_readers, num_writers, os.cpu_count() or 0, num_gpus)
+        logger.info(
+            "Worker pool: %d readers, %d writers (%d cores, %d GPUs)",
+            num_readers,
+            num_writers,
+            os.cpu_count() or 0,
+            num_gpus,
+        )
 
         # Tracking
         completed_count = [0]
         failed_frames: list[int] = []
         failed_lock = threading.Lock()
+        pipeline_t0 = time.perf_counter()
+        profiler = _TimelineProfiler(pipeline_t0)
 
         self._shutdown_event.clear()
 
@@ -454,51 +562,82 @@ class AsyncInferencePipeline:
 
         # --- Flow control ---
         #
-        # Backpressure chain: disk ← writers ← write_sem ← inference ← work_q ← readers
+        # Backpressure chain: disk ← write_pool ← write_q ← inference ← work_q ← readers
         #
         # work_q (maxsize=prefetch) throttles readers: when GPUs can't keep up,
         # the queue fills and readers block on put(), naturally pacing disk reads.
         #
-        # Write backpressure: a shared semaphore limits in-flight writes.
-        # When writers can't flush to disk fast enough, inference threads
-        # block before submitting new writes, which backs up into work_q
-        # and naturally paces reads.
-        #
-        # A shared pool (not per-GPU) avoids starving faster GPUs when
-        # GPU speeds are mismatched — the fast GPU can use idle writers
-        # from the slow GPU's share.
-        write_sem = threading.Semaphore(num_writers * 2)
+        # Write concurrency is bounded by write_pool's max_workers — no
+        # semaphore needed.  The write drain thread submits freely; excess
+        # tasks queue inside the ThreadPoolExecutor which handles its own
+        # backpressure.  This avoids any blocking on the drain thread.
 
-        def reader_task(read_pool: ThreadPoolExecutor):
-            """Submit frame reads to thread pool, feed work_q as reads complete.
+        # Memory headroom: stop reading when available RAM would drop
+        # below this threshold.  Resumes when drain frees enough memory.
+        _MEM_HEADROOM = 1 * 1024 * 1024 * 1024  # 1 GB
+        _last_frame_bytes = [0]  # estimated from last completed read
 
-            All frames are submitted to the pool upfront.  Backpressure comes
-            from work_q (maxsize=prefetch): when the queue fills, the
-            as_completed loop blocks on put(), which is fine — reader threads
-            in the pool keep decoding ahead but only num_readers are active
-            at any time, limiting disk I/O contention with writers.
+        def _available_ram() -> int:
+            """Available system memory in bytes (Linux fast path)."""
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemAvailable:"):
+                            return int(line.split()[1]) * 1024
+            except OSError:
+                pass
+            # Fallback
+            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+        def reader_task(read_pool: ThreadPoolExecutor) -> None:
+            """Submit frame reads incrementally, feed work_q as reads complete.
+
+            Submits at most `prefetch` reads ahead of consumption, and
+            pauses when available system RAM minus one frame's estimated
+            size would drop below 1 GB.  Resumes when the drain frees
+            memory by writing and releasing resolved frames.
             """
-            future_to_index = {}
-            for i in range(num_frames):
-                if self._shutdown_event.is_set():
-                    break
-                f = read_pool.submit(
-                    _read_frame_pair,
-                    input_paths[i],
-                    alpha_paths[i],
-                    i,
-                    input_stems[i],
-                )
-                future_to_index[f] = i
+            next_submit = 0
+            in_flight: dict[Any, int] = {}  # future → frame index
 
-            # Feed work_q as reads complete (not in order — avoids head-of-line blocking)
-            for f in as_completed(future_to_index):
+            def _mem_ok() -> bool:
+                """True if we have enough RAM to decode another frame."""
+                if _last_frame_bytes[0] == 0:
+                    return True  # no estimate yet, allow first reads
+                return _available_ram() - _last_frame_bytes[0] > _MEM_HEADROOM
+
+            def _submit_batch() -> None:
+                """Submit reads up to prefetch limit, respecting RAM."""
+                nonlocal next_submit
+                while next_submit < num_frames and len(in_flight) < prefetch:
+                    if self._shutdown_event.is_set():
+                        break
+                    if not _mem_ok():
+                        break
+                    f = read_pool.submit(
+                        _read_frame_pair,
+                        input_paths[next_submit],
+                        alpha_paths[next_submit],
+                        next_submit,
+                        input_stems[next_submit],
+                    )
+                    in_flight[f] = next_submit
+                    next_submit += 1
+
+            _submit_batch()
+
+            while in_flight:
                 if self._shutdown_event.is_set():
                     break
-                i = future_to_index[f]
+                # Wait for any one read to complete
+                done = next(as_completed(in_flight))
+                i = in_flight.pop(done)
                 try:
-                    packet = f.result()
+                    packet = done.result()
                     if packet is not None:
+                        # Update frame size estimate
+                        _last_frame_bytes[0] = packet.img_raw.nbytes + packet.mask_raw.nbytes
+                        profiler.mark("reader", "read_done", i)
                         work_q.put(packet)
                     else:
                         with failed_lock:
@@ -508,6 +647,14 @@ class AsyncInferencePipeline:
                     with failed_lock:
                         failed_frames.append(i)
 
+                # Refill: submit more reads now that one slot freed up
+                # If memory is tight, wait for drain to free some
+                if next_submit < num_frames and not _mem_ok():
+                    profiler.mark("reader", "mem_wait", next_submit)
+                    while not _mem_ok() and not self._shutdown_event.is_set():
+                        threading.Event().wait(0.1)
+                _submit_batch()
+
             # Signal inference threads to stop
             for _ in range(num_gpus):
                 work_q.put(_SHUTDOWN)
@@ -516,49 +663,69 @@ class AsyncInferencePipeline:
         write_futures: list[tuple[int, Any]] = []
         write_futures_lock = threading.Lock()
 
-        profilers: list[_StageProfiler] = []
-        profilers_lock = threading.Lock()
+        # Write queue decouples inference threads from post-inference work.
+        # The inference thread only does GPU work and passes
+        # (packet, PendingTransfer) to write workers via write_q.
+        write_q: queue.Queue[tuple[FramePacket, Any] | None] = queue.Queue()
 
-        def _submit_write(packet: FramePacket, result: dict, write_pool: ThreadPoolExecutor, prof: _StageProfiler) -> None:
-            """Build write list from result dict and submit to writer pool."""
-            prof.begin("write_submit")
+        def _resolve_and_submit(item: tuple[FramePacket, Any], write_pool: ThreadPoolExecutor) -> None:
+            """Resolve one DMA transfer and submit file writes to the pool."""
+            packet, transfer_or_result = item
+            fidx = packet.index
+
+            # Resolve PendingTransfer → numpy dict
+            t_res = profiler.span_begin("write_drain", "dma_resolve", fidx)
+            if hasattr(transfer_or_result, "resolve"):
+                result = transfer_or_result.resolve()
+            else:
+                result = transfer_or_result
+            profiler.span_end("write_drain", "dma_resolve", t_res, fidx)
+
             stem = packet.input_stem
             alpha = result["alpha"]
             if alpha.ndim == 3:
                 alpha = alpha[:, :, 0]
 
             write_list: list[tuple[np.ndarray, str, list[int] | None, int | None]] = [
-                (result["fg"], os.path.join(output_dirs["fg"], f"{stem}.exr"),
-                 _EXR_FLAGS, cv2.COLOR_RGB2BGR),
-                (alpha, os.path.join(output_dirs["matte"], f"{stem}.exr"),
-                 _EXR_FLAGS, None),
-                (result["comp"], os.path.join(output_dirs["comp"], f"{stem}.png"),
-                 None, _PNG_PREP),
+                (result["fg"], os.path.join(output_dirs["fg"], f"{stem}.exr"), _EXR_FLAGS, cv2.COLOR_RGB2BGR),
+                (alpha, os.path.join(output_dirs["matte"], f"{stem}.exr"), _EXR_FLAGS, None),
+                (result["comp"], os.path.join(output_dirs["comp"], f"{stem}.png"), None, _PNG_PREP),
             ]
             processed = result.get("processed")
             if processed is not None:
                 write_list.append(
-                    (processed, os.path.join(output_dirs["processed"], f"{stem}.exr"),
-                     _EXR_FLAGS, cv2.COLOR_RGBA2BGRA)
+                    (processed, os.path.join(output_dirs["processed"], f"{stem}.exr"), _EXR_FLAGS, cv2.COLOR_RGBA2BGRA)
                 )
 
-            write_sem.acquire()
             fut = write_pool.submit(_write_frame_outputs, write_list)
             with write_futures_lock:
-                write_futures.append((packet.index, fut))
-            prof.end("write_submit")
+                write_futures.append((fidx, fut))
 
-        def inference_worker(device_str: str, engine: Any, write_pool: ThreadPoolExecutor):
-            """Pull frames from work_q, run deferred-DMA inference, submit writes.
+        def _drain_worker(write_pool: ThreadPoolExecutor) -> None:
+            """Persistent drain worker — pulls items from write_q until None.
 
-            Uses process_raw_deferred so the GPU→CPU DMA transfer for
-            frame N overlaps with frame N+1's preprocess + forward pass.
-            The previous frame's transfer is resolved (synced) just before
-            submitting its write job.
+            Multiple drain workers run concurrently (num_gpus of them),
+            giving one resolve in flight per GPU.  Each does DMA sync +
+            numpy copies, then hands file writes to the write pool.
             """
-            prof = _StageProfiler(device_str)
-            with profilers_lock:
-                profilers.append(prof)
+            while True:
+                item = write_q.get()
+                if item is None:
+                    # Put sentinel back for the next worker to see
+                    write_q.put(None)
+                    break
+                _resolve_and_submit(item, write_pool)
+
+        def inference_worker(device_str: str, engine: Any, write_pool: ThreadPoolExecutor) -> None:
+            """Pull frames from work_q, run deferred-DMA inference, hand off to writer.
+
+            Uses process_raw_deferred so the GPU→CPU DMA runs on the copy
+            stream while the next frame's forward pass runs on the compute
+            stream.  The PendingTransfer is passed directly to the write
+            drain thread — the inference thread never calls resolve() and
+            never blocks on numpy copies.
+            """
+            gpu_label = f"gpu:{device_str}"
 
             if device_str.startswith("cuda"):
                 dev_idx = int(device_str.split(":")[1]) if ":" in device_str else 0
@@ -566,23 +733,24 @@ class AsyncInferencePipeline:
 
             first_frame = True
             pending_transfer = None  # PendingTransfer from previous frame
-            pending_packet = None    # FramePacket from previous frame
+            pending_packet = None  # FramePacket from previous frame
 
             while not self._shutdown_event.is_set():
-                prof.begin("queue_wait")
+                t_wait = profiler.span_begin(gpu_label, "queue_wait")
                 item = work_q.get()
-                prof.end("queue_wait")
+                profiler.span_end(gpu_label, "queue_wait", t_wait)
                 if item is _SHUTDOWN:
                     break
 
                 packet: FramePacket = item
+                fidx = packet.index
                 if first_frame:
-                    logger.info("%s: first frame received (idx=%d, %dx%d)",
-                                device_str, packet.index, packet.orig_w, packet.orig_h)
+                    logger.info(
+                        "%s: first frame received (idx=%d, %dx%d)", device_str, fidx, packet.orig_w, packet.orig_h
+                    )
 
                 try:
-                    timings: dict = {}
-                    t_inf0 = time.perf_counter()
+                    t_fwd = profiler.span_begin(gpu_label, "forward", fidx)
                     transfer = engine.process_raw_deferred(
                         packet.img_raw,
                         packet.mask_raw,
@@ -594,27 +762,18 @@ class AsyncInferencePipeline:
                         auto_despeckle=settings.auto_despeckle,
                         despeckle_size=settings.despeckle_size,
                         refiner_scale=settings.refiner_scale,
-                        _timings=timings,
                     )
+                    profiler.span_end(gpu_label, "forward", t_fwd, fidx)
+
                     if first_frame:
-                        logger.info("%s: first frame done in %.1fs (preprocess=%.3f forward=%.3f postprocess=%.3f)",
-                                    device_str, time.perf_counter() - t_inf0,
-                                    timings.get("preprocess", 0), timings.get("forward", 0), timings.get("postprocess", 0))
+                        logger.info("%s: first frame inference done", device_str)
                         first_frame = False
 
-                    # Record sub-stage timings
-                    for stage, elapsed in timings.items():
-                        prof.begin(stage)
-                        prof._t0 = time.perf_counter() - elapsed
-                        prof.end(stage)
-
-                    # Resolve PREVIOUS frame's DMA (overlapped with current
-                    # frame's preprocess + forward on the compute stream).
+                    # Hand off PREVIOUS frame's PendingTransfer to the write
+                    # drain thread.  DMA resolve + numpy copies happen there,
+                    # keeping this thread free for GPU work.
                     if pending_transfer is not None:
-                        prof.begin("dma_resolve")
-                        result = pending_transfer.resolve()
-                        prof.end("dma_resolve")
-                        _submit_write(pending_packet, result, write_pool, prof)
+                        write_q.put((pending_packet, pending_transfer))
 
                     # Rotate: current becomes pending
                     pending_transfer = transfer
@@ -623,17 +782,13 @@ class AsyncInferencePipeline:
                 except torch.cuda.OutOfMemoryError:
                     logger.error(
                         "\033[1mCUDA OOM on %s for frame %d — taking GPU offline\033[0m",
-                        device_str, packet.index,
+                        device_str,
+                        packet.index,
                     )
                     torch.cuda.empty_cache()
                     # Drain pending before going offline
                     if pending_transfer is not None:
-                        try:
-                            result = pending_transfer.resolve()
-                            _submit_write(pending_packet, result, write_pool, prof)
-                        except Exception:
-                            with failed_lock:
-                                failed_frames.append(pending_packet.index)
+                        write_q.put((pending_packet, pending_transfer))
                         pending_transfer = None
                     with failed_lock:
                         failed_frames.append(packet.index)
@@ -643,21 +798,12 @@ class AsyncInferencePipeline:
                     with failed_lock:
                         failed_frames.append(packet.index)
 
-            # Drain: resolve the last frame's DMA
+            # Drain: hand off the last frame's PendingTransfer
             if pending_transfer is not None:
-                try:
-                    prof.begin("dma_resolve")
-                    result = pending_transfer.resolve()
-                    prof.end("dma_resolve")
-                    _submit_write(pending_packet, result, write_pool, prof)
-                except Exception as e:
-                    logger.warning("Final DMA resolve error frame %d on %s: %s",
-                                   pending_packet.index, device_str, e)
-                    with failed_lock:
-                        failed_frames.append(pending_packet.index)
+                write_q.put((pending_packet, pending_transfer))
 
         # --- Writer/progress stage (resolves write futures, updates progress) ---
-        def progress_task():
+        def progress_task() -> None:
             """Wait for write futures to complete and update progress bar."""
             resolved = 0
             target = num_frames
@@ -683,12 +829,11 @@ class AsyncInferencePipeline:
                         try:
                             fut.result()
                             completed_count[0] += 1
+                            profiler.frame_completed()
                         except Exception as e:
                             logger.warning("Write error frame %d: %s", frame_idx, e)
                             with failed_lock:
                                 failed_frames.append(frame_idx)
-                        finally:
-                            write_sem.release()
                         resolved += 1
                         pbar.update(1)
                 else:
@@ -707,6 +852,18 @@ class AsyncInferencePipeline:
         reader_thread = threading.Thread(target=reader_task, args=(read_pool,), name="pipeline-reader", daemon=True)
         progress_thread = threading.Thread(target=progress_task, name="pipeline-progress", daemon=True)
 
+        # N persistent drain workers (one per GPU) pull from write_q.
+        # Bounded concurrency: at most num_gpus resolves in flight.
+        drain_threads = [
+            threading.Thread(
+                target=_drain_worker,
+                args=(write_pool,),
+                name=f"pipeline-drain-{i}",
+                daemon=True,
+            )
+            for i in range(num_gpus)
+        ]
+
         inference_threads = []
         for device_str, engine in self.engines:
             t = threading.Thread(
@@ -717,11 +874,12 @@ class AsyncInferencePipeline:
             )
             inference_threads.append(t)
 
-        pipeline_t0 = time.perf_counter()
         reader_done_t = inference_done_t = pipeline_done_t = pipeline_t0
 
         try:
             reader_thread.start()
+            for dt in drain_threads:
+                dt.start()
             for t in inference_threads:
                 t.start()
             progress_thread.start()
@@ -734,6 +892,11 @@ class AsyncInferencePipeline:
             for t in inference_threads:
                 t.join()
             inference_done_t = time.perf_counter()
+
+            # Signal drain workers to stop (one None cascades via put-back)
+            write_q.put(None)
+            for dt in drain_threads:
+                dt.join()
 
             # Signal progress thread that inference is done
             inference_done_event.set()
@@ -760,12 +923,15 @@ class AsyncInferencePipeline:
                 except queue.Empty:
                     break
             for _ in range(num_gpus):
-                try:
+                with contextlib.suppress(queue.Full):
                     work_q.put_nowait(_SHUTDOWN)
-                except queue.Full:
-                    pass
+
+            # Stop drain workers
+            write_q.put(None)
 
             reader_thread.join(timeout=10)
+            for dt in drain_threads:
+                dt.join(timeout=5)
             for t in inference_threads:
                 t.join(timeout=10)
             progress_thread.join(timeout=5)
@@ -786,31 +952,43 @@ class AsyncInferencePipeline:
                 failed_frames[:20] if num_failed > 20 else failed_frames,
             )
 
-        # Report pipeline-level timing
+        # Report timing
         total_wall = pipeline_done_t - pipeline_t0
         read_wall = reader_done_t - pipeline_t0
         infer_wall = inference_done_t - pipeline_t0
         write_drain = pipeline_done_t - inference_done_t
+
+        # Console summary
         logger.info(
-            "\n  Pipeline wall-clock breakdown:\n"
-            "    read phase       : %7.2fs  (readers submitting to queue)\n"
-            "    inference phase  : %7.2fs  (all GPUs done)\n"
-            "    write drain      : %7.2fs  (flushing remaining EXR/PNG writes)\n"
-            "    total            : %7.2fs  (%.1f fps)",
-            read_wall, infer_wall, write_drain, total_wall,
-            num_frames / total_wall if total_wall > 0 else 0,
+            profiler.console_summary(
+                num_frames,
+                total_wall,
+                self._warmup_time,
+                read_wall,
+                infer_wall,
+                write_drain,
+            )
         )
 
-        # Report per-GPU profiling
-        for prof in profilers:
-            logger.info("\n%s", prof.summary())
-
-        # Report peak VRAM per GPU
+        # Peak VRAM per GPU
         for dev_str, _ in self.engines:
             if dev_str.startswith("cuda"):
                 dev_idx = int(dev_str.split(":")[1]) if ":" in dev_str else 0
                 peak_mb = torch.cuda.max_memory_allocated(dev_idx) / (1024**2)
-                logger.info("Peak VRAM %s: %.0f MB (%.2f GB)", dev_str, peak_mb, peak_mb / 1024)
+                logger.info("  Peak VRAM %s: %.0f MB (%.2f GB)", dev_str, peak_mb, peak_mb / 1024)
+
+        # Write CSV timeline for offline analysis
+        csv_path = os.path.join(
+            next(iter(output_dirs.values())) if output_dirs else ".",
+            "..",
+            "pipeline_profile.csv",
+        )
+        try:
+            csv_path = os.path.normpath(csv_path)
+            profiler.write_csv(csv_path)
+            logger.info("  Timeline CSV: %s", csv_path)
+        except Exception as e:
+            logger.debug("Could not write timeline CSV: %s", e)
 
         return {
             "total": num_frames,

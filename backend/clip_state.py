@@ -69,10 +69,10 @@ class ClipAsset:
     asset_type: str  # 'sequence' or 'video'
     frame_count: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self._calculate_length()
 
-    def _calculate_length(self):
+    def _calculate_length(self) -> None:
         if self.asset_type == "sequence":
             if os.path.isdir(self.path):
                 files = [f for f in os.listdir(self.path) if _is_image_file(f)]
@@ -238,7 +238,7 @@ class ClipEntry:
         try:
             import json
 
-            with open(manifest_path, "r") as f:
+            with open(manifest_path) as f:
                 return json.load(f)
         except Exception as e:
             logger.debug(f"Failed to read manifest at {manifest_path}: {e}")
@@ -386,9 +386,9 @@ def scan_project_clips(project_dir: str) -> list[ClipEntry]:
     if is_v2_project(project_dir):
         clips_dir = os.path.join(project_dir, "clips")
         entries: list[ClipEntry] = []
-        for item in sorted(os.listdir(clips_dir)):
+        for item in natsorted(os.listdir(clips_dir)):
             item_path = os.path.join(clips_dir, item)
-            if item.startswith(".") or item.startswith("_"):
+            if item.startswith((".", "_")):
                 continue
             if not os.path.isdir(item_path):
                 continue
@@ -447,7 +447,7 @@ def scan_clips_dir(
         item_path = os.path.join(clips_dir, item)
 
         # Skip hidden and special items
-        if item.startswith(".") or item.startswith("_"):
+        if item.startswith((".", "_")):
             continue
 
         if os.path.isdir(item_path):

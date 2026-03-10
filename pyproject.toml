@@ -49,6 +49,10 @@ dev = [
     "ruff",
 ]
 
+# TensorRT (optional): install torch-tensorrt manually to match your torch version.
+# See https://pytorch.org/TensorRT/getting_started/installation.html
+# Usage: uv pip install torch-tensorrt && corridorkey --tensorrt
+
 [project.scripts]
 corridorkey = "corridorkey_cli:main"
 
@@ -65,7 +69,37 @@ line-length = 120
 extend-exclude = ["gvm_core/", "VideoMaMaInferenceModule/"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B"]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "UP",     # pyupgrade
+    "ANN",    # flake8-annotations
+    "RUF",    # ruff-specific rules
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "PIE",    # flake8-pie
+    "RET",    # flake8-return
+    "C4",     # flake8-comprehensions
+    "PT",     # flake8-pytest-style
+    "PYI",    # flake8-pyi
+    "T20",    # flake8-print
+]
+ignore = [
+    "ANN401",  # Dynamically typed expressions (typing.Any) are disallowed
+    "RET504",  # unnecessary assignment before return
+    "SIM108",  # use ternary operator (often less readable)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "T20"]
+"corridorkey_cli.py" = ["T20"]  # CLI prints are expected
+"benchmark_4k_vram.py" = ["T20", "ANN"]
+"test_vram.py" = ["T20", "ANN"]
+"download_test_scene.py" = ["T20", "ANN"]
+"tears_of_steel_test/*" = ["T20", "ANN"]
 
 [tool.ruff.format]
 # Third-party code excluded via top-level exclude

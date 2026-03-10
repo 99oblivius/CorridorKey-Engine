@@ -9,10 +9,13 @@ model variant.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import os
 import sys
+import threading
 from abc import ABC, abstractmethod
+from typing import Any
 
 import cv2
 import numpy as np
@@ -23,6 +26,24 @@ import torch.nn.functional as F
 from .core import color_utils as cu
 from .optimization_config import OptimizationConfig, PerformanceMetrics
 
+logger = logging.getLogger(__name__)
+
+
+class _GreenFormerTRT(nn.Module):
+    """Wrapper that returns a flat tuple for TensorRT compatibility.
+
+    TensorRT requires tensor outputs, not dicts.  This wrapper converts
+    the dict return to a tuple, and :meth:`_run_forward` converts it back.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.model(x)
+        return out["alpha"], out["fg"]
+
 
 @dataclasses.dataclass
 class PendingTransfer:
@@ -30,24 +51,41 @@ class PendingTransfer:
 
     Returned by ``_postprocess_gpu(sync=False)``.  Call :meth:`resolve`
     to block until the DMA completes and get the numpy result dict.
+
+    Each transfer records a CUDA event immediately after its DMA is
+    enqueued on the copy stream.  ``resolve()`` waits on that specific
+    event rather than synchronizing the entire stream.
+
+    The transfer also holds a ``threading.Event`` (``_buf_released``)
+    that is set after ``resolve()`` copies data out of the pinned
+    buffer.  The engine waits on this before reusing that buffer slot,
+    guaranteeing the DMA data is never overwritten prematurely.
     """
 
-    _copy_stream: torch.cuda.Stream | None
+    _event: torch.cuda.Event | None
     _pinned_buf: torch.Tensor | None
     _cpu_result: dict[str, np.ndarray] | None  # set for CPU fallback
+    _buf_released: threading.Event | None  # signalled after numpy .copy()
+    _gpu_bulk: torch.Tensor | None = None  # prevents caching allocator reuse during DMA
 
     def resolve(self) -> dict[str, np.ndarray]:
-        """Block until DMA completes, return numpy arrays."""
+        """Block until this transfer's DMA completes, return numpy arrays."""
         if self._cpu_result is not None:
             return self._cpu_result
-        self._copy_stream.synchronize()
+        self._event.synchronize()
+        # Release GPU bulk tensor — DMA is done, caching allocator can reuse
+        self._gpu_bulk = None
         bulk_np = self._pinned_buf.numpy()
-        return {
+        result = {
             "alpha": bulk_np[:, :, 0:1].copy(),
             "fg": bulk_np[:, :, 1:4].copy(),
             "comp": bulk_np[:, :, 4:7].copy(),
             "processed": bulk_np[:, :, 7:11].copy(),
         }
+        # Signal that this buffer slot can be reused
+        if self._buf_released is not None:
+            self._buf_released.set()
+        return result
 
 
 class _BaseCorridorKeyEngine(ABC):
@@ -88,13 +126,21 @@ class _BaseCorridorKeyEngine(ABC):
         # copies run on _copy_stream so stream.synchronize() only waits for
         # the copy, releasing the GIL without blocking other GPUs' compute.
         self._copy_stream: torch.cuda.Stream | None = None
-        # Double-buffered pinned-memory for D2H transfer.  Two buffers
-        # allow deferred DMA: frame N's transfer runs on the copy stream
-        # while frame N+1's forward runs on the compute stream, using the
-        # other buffer.  Avoids per-frame cudaHostAlloc (~100ms overhead).
-        self._pinned_bufs: list[torch.Tensor | None] = [None, None]
-        self._pinned_shapes: list[tuple] = [(), ()]
+        # Triple-buffered pinned-memory for D2H transfer.  Three buffers
+        # give the drain worker time to resolve (copy out) a frame's data
+        # before its buffer slot is reused.  Each slot has a release event
+        # that the drain sets after copying — the engine waits on it
+        # before reusing the slot, making buffer corruption impossible
+        # regardless of drain latency.
+        _NUM_PINNED = 3
+        self._pinned_bufs: list[torch.Tensor | None] = [None] * _NUM_PINNED
+        self._pinned_shapes: list[tuple] = [()] * _NUM_PINNED
         self._pinned_idx: int = 0
+        self._num_pinned: int = _NUM_PINNED
+        # One release event per buffer slot — set when drain copies out
+        self._pinned_released: list[threading.Event] = [threading.Event() for _ in range(_NUM_PINNED)]
+        for ev in self._pinned_released:
+            ev.set()  # all slots start as "available"
 
         # Refiner scale hook (registered once, controlled via attribute)
         self._refiner_scale: float = 1.0
@@ -103,12 +149,12 @@ class _BaseCorridorKeyEngine(ABC):
         # Engine-level optimization: disable cuDNN benchmark
         if self.config.disable_cudnn_benchmark and self.device.type == "cuda":
             torch.backends.cudnn.benchmark = False
-            print("[Optimized] cuDNN benchmark disabled (saves 2-5 GB workspace).")
+            logger.info("[Optimized] cuDNN benchmark disabled (saves 2-5 GB workspace).")
 
         # TF32 matmul precision (Ampere+): negligible quality impact, measurable speedup
         if self.config.high_matmul_precision:
             torch.set_float32_matmul_precision("high")
-            print("[Optimized] TF32 matmul precision enabled.")
+            logger.info("[Optimized] TF32 matmul precision enabled.")
 
         self.model = self._load_model()
 
@@ -118,26 +164,42 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Register persistent refiner scale hook (must be before torch.compile)
         if self.model.refiner is not None:
-            def _scale_hook(module, input, output):
+
+            def _scale_hook(module: torch.nn.Module, input: Any, output: torch.Tensor) -> torch.Tensor:
                 if self._refiner_scale != 1.0:
                     return output * self._refiner_scale
                 return output
+
             self._refiner_hook_handle = self.model.refiner.register_forward_hook(_scale_hook)
 
-        # torch.compile: JIT-compile the model for fused kernels and optimized memory.
+        # Model compilation: TensorRT or torch.compile.
         # Applied at instance level (not class decorator) to avoid conflict with
         # timm's FX-based feature extraction.  Must be after hook registration so
         # hooks are baked into the compiled graph instead of causing graph breaks.
         # Based on work by Marcel Lieb (https://github.com/MarcelLieb/CorridorKey)
-        if sys.platform in ("linux", "win32") and self.device.type == "cuda":
-            # Enable FX graph cache so graph tracing + inductor lowering
-            # (the single-threaded phases) are skipped on subsequent runs.
-            # Only the first run pays the full compilation cost.
-            import torch._inductor.config as _inductor_cfg
-            _inductor_cfg.fx_graph_cache = True
+        self._use_trt = False
+        self._trt_model: nn.Module | None = None
 
-            self.model = torch.compile(self.model)
-            print("[Optimized] torch.compile enabled (FX cache).")
+        if sys.platform in ("linux", "win32") and self.device.type == "cuda":
+            if self.config.tensorrt:
+                self._use_trt = self._try_tensorrt_compile()
+
+            if not self._use_trt:
+                # Enable FX graph cache so graph tracing + inductor lowering
+                # (the single-threaded phases) are skipped on subsequent runs.
+                # Only the first run pays the full compilation cost.
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.fx_graph_cache = True
+
+                self.model = torch.compile(self.model, mode=self.config.compile_mode)
+                mode_label = self.config.compile_mode
+                logger.info("[Optimized] torch.compile enabled (mode=%s, FX cache).", mode_label)
+
+        # CUDA graph capture state (populated by capture_cuda_graph())
+        self._cuda_graph: torch.cuda.CUDAGraph | None = None
+        self._graph_input: torch.Tensor | None = None
+        self._graph_output: dict[str, torch.Tensor] | None = None
 
         # Create copy stream after model is loaded (avoids interfering with compile)
         if self.device.type == "cuda":
@@ -172,9 +234,127 @@ class _BaseCorridorKeyEngine(ABC):
         expected LTRM keys gracefully.
         """
         if missing:
-            print(f"[Warning] Missing keys: {missing}")
+            logger.warning("[Warning] Missing keys: %s", missing)
         if unexpected:
-            print(f"[Warning] Unexpected keys: {unexpected}")
+            logger.warning("[Warning] Unexpected keys: %s", unexpected)
+
+    # ------------------------------------------------------------------
+    # CUDA graph capture
+    # ------------------------------------------------------------------
+
+    def capture_cuda_graph(self) -> None:
+        """Capture the model forward pass as a CUDA graph.
+
+        Must be called after torch.compile warmup so that the compiled
+        kernels are stable.  The captured graph replays the exact same
+        kernel sequence on every frame, eliminating CPU-side kernel
+        launch overhead.
+
+        Requires ``config.cuda_graphs=True`` and a CUDA device.
+        """
+        if self.device.type != "cuda":
+            logger.info("[CUDA Graph] Skipped — not a CUDA device.")
+            return
+
+        logger.info("[CUDA Graph] Running warmup passes before capture...")
+
+        static_input = torch.zeros(
+            1,
+            4,
+            self.img_size,
+            self.img_size,
+            device=self.device,
+            dtype=self.config.model_dtype,
+        )
+
+        # Warmup: run 3 eager passes to stabilize cuDNN/cublas workspace
+        for _ in range(3):
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=self.config.effective_mixed_precision,
+            ):
+                _ = self.model(static_input)
+        torch.cuda.synchronize(self.device)
+
+        # Capture
+        self._cuda_graph = torch.cuda.CUDAGraph()
+        self._graph_input = static_input
+
+        with (
+            torch.cuda.graph(self._cuda_graph, stream=torch.cuda.current_stream(self.device)),
+            torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=self.config.effective_mixed_precision,
+            ),
+        ):
+            self._graph_output = self.model(static_input)
+
+        logger.info("[CUDA Graph] Captured successfully.")
+
+    def _run_forward(self, inp_t: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Run the model forward pass, using CUDA graph replay if captured.
+
+        When a CUDA graph is captured, replays it with ``inp_t`` copied
+        into the static input buffer.  Otherwise, runs the model normally
+        under autocast.
+        """
+        if self._cuda_graph is not None:
+            self._graph_input.copy_(inp_t)
+            self._cuda_graph.replay()
+            return self._graph_output
+
+        if self._use_trt:
+            alpha, fg = self._trt_model(inp_t)
+            return {"alpha": alpha, "fg": fg}
+
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.config.effective_mixed_precision,
+        ):
+            return self.model(inp_t)
+
+    # ------------------------------------------------------------------
+    # TensorRT compilation
+    # ------------------------------------------------------------------
+
+    def _try_tensorrt_compile(self) -> bool:
+        """Attempt to compile the model with TensorRT.
+
+        Returns ``True`` on success, ``False`` on failure (missing package,
+        unsupported ops, etc.).  On failure, the caller falls back to
+        ``torch.compile``.
+        """
+        try:
+            import torch_tensorrt
+        except ImportError:
+            logger.info("[TensorRT] torch-tensorrt not installed — falling back to torch.compile.")
+            return False
+
+        try:
+            logger.info("[TensorRT] Compiling model (this may take several minutes on first run)...")
+            wrapper = _GreenFormerTRT(self.model)
+
+            self._trt_model = torch_tensorrt.compile(
+                wrapper,
+                inputs=[
+                    torch_tensorrt.Input(
+                        shape=[1, 4, self.img_size, self.img_size],
+                        dtype=torch.float16,
+                    )
+                ],
+                enabled_precisions={torch.float16},
+                workspace_size=1 << 30,  # 1 GB workspace
+                truncate_long_and_double=True,
+            )
+            logger.info("[TensorRT] Compilation successful.")
+            return True
+        except Exception as e:
+            logger.warning("[TensorRT] Compilation failed: %s", e)
+            logger.info("[TensorRT] Falling back to torch.compile.")
+            return False
 
     # ------------------------------------------------------------------
     # Checkpoint loading (shared)
@@ -182,7 +362,7 @@ class _BaseCorridorKeyEngine(ABC):
 
     def _load_model(self) -> nn.Module:
         """Load the checkpoint into the model returned by :meth:`_create_model`."""
-        print(f"Loading CorridorKey from {self.checkpoint_path}...")
+        logger.info("Loading CorridorKey from %s...", self.checkpoint_path)
 
         model = self._create_model()
         model = model.to(self.config.model_dtype).to(self.device)
@@ -203,18 +383,17 @@ class _BaseCorridorKeyEngine(ABC):
                 k = k[10:]
 
             # PosEmbed interpolation
-            if "pos_embed" in k and k in model_state:
-                if v.shape != model_state[k].shape:
-                    print(f"Resizing {k} from {v.shape} to {model_state[k].shape}")
-                    N_src = v.shape[1]
-                    C = v.shape[2]
-                    grid_src = int(math.sqrt(N_src))
-                    N_dst = model_state[k].shape[1]
-                    grid_dst = int(math.sqrt(N_dst))
+            if "pos_embed" in k and k in model_state and v.shape != model_state[k].shape:
+                logger.info("Resizing %s from %s to %s", k, v.shape, model_state[k].shape)
+                N_src = v.shape[1]
+                C = v.shape[2]
+                grid_src = int(math.sqrt(N_src))
+                N_dst = model_state[k].shape[1]
+                grid_dst = int(math.sqrt(N_dst))
 
-                    v_img = v.permute(0, 2, 1).view(1, C, grid_src, grid_src)
-                    v_resized = F.interpolate(v_img, size=(grid_dst, grid_dst), mode="bicubic", align_corners=False)
-                    v = v_resized.flatten(2).transpose(1, 2)
+                v_img = v.permute(0, 2, 1).view(1, C, grid_src, grid_src)
+                v_resized = F.interpolate(v_img, size=(grid_dst, grid_dst), mode="bicubic", align_corners=False)
+                v = v_resized.flatten(2).transpose(1, 2)
 
             new_state_dict[k] = v
 
@@ -223,10 +402,10 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Report VRAM after loading
         if self.config.model_precision != "float32":
-            print(f"[Optimized] Model weights stored in {self.config.model_precision}.")
+            logger.info("[Optimized] Model weights stored in %s.", self.config.model_precision)
         if self.device.type == "cuda":
             allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
-            print(f"Model loaded. GPU memory: {allocated:.2f} GB")
+            logger.info("Model loaded. GPU memory: %.2f GB", allocated)
 
         return model
 
@@ -260,7 +439,7 @@ class _BaseCorridorKeyEngine(ABC):
         spot of area A has radius sqrt(A/pi), so erosion by that radius
         eliminates it.
         """
-        device = alpha.device
+        _device = alpha.device
         # alpha: [H, W, 1]
         a2d = alpha[:, :, 0]
         mask = (a2d > 0.5).float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
@@ -268,6 +447,7 @@ class _BaseCorridorKeyEngine(ABC):
         # Erode: kill spots smaller than area_threshold
         # A circle of area A has radius r = sqrt(A / pi)
         import math
+
         erode_r = max(1, int(math.sqrt(area_threshold / math.pi)))
         erode_k = erode_r * 2 + 1
         # Erosion = negative of max_pool on negated mask
@@ -364,11 +544,14 @@ class _BaseCorridorKeyEngine(ABC):
         # === 3. Prepare tensor and normalize on GPU ===
         inp_np = np.concatenate([img_resized, mask_resized], axis=-1)  # [H, W, 4]
         # Transfer to GPU, then normalize there to avoid CPU float intermediates
-        inp_t = torch.as_tensor(inp_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-        inp_t = inp_t.to(self.device, non_blocking=True)
+        inp_cpu = torch.as_tensor(inp_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+        inp_t = inp_cpu.to(self.device, non_blocking=True)
 
         # Normalize RGB channels on GPU, leave mask channel as-is
+        # (this op depends on inp_t, so CUDA stream ordering guarantees
+        # the H2D DMA completes before it runs; inp_cpu ref keeps numpy alive)
         inp_t[:, :3] = (inp_t[:, :3] - self._mean_t) / self._std_t
+        del inp_cpu  # safe to release after first GPU op that depends on inp_t
 
         # === 4. Inference ===
         self._refiner_scale = refiner_scale
@@ -377,38 +560,45 @@ class _BaseCorridorKeyEngine(ABC):
             ctx = metrics.measure("inference", self.device)
         else:
             from contextlib import nullcontext
+
             ctx = nullcontext()
 
         with ctx:
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=self.config.effective_mixed_precision,
-            ):
-                out = self.model(inp_t)
+            out = self._run_forward(inp_t)
 
         pred_alpha = out["alpha"]  # [1, 1, model_size, model_size]
-        pred_fg = out["fg"]        # [1, 3, model_size, model_size]
+        pred_fg = out["fg"]  # [1, 3, model_size, model_size]
 
         # === 5. Post-process ===
         if metrics is not None:
             ctx_post = metrics.measure("postprocess", self.device)
         else:
             from contextlib import nullcontext
+
             ctx_post = nullcontext()
 
         with ctx_post:
             if use_gpu_postprocess:
                 result = self._postprocess_gpu(
-                    pred_alpha, pred_fg, h, w,
-                    auto_despeckle, despeckle_size,
-                    despill_strength, fg_is_straight,
+                    pred_alpha,
+                    pred_fg,
+                    h,
+                    w,
+                    auto_despeckle,
+                    despeckle_size,
+                    despill_strength,
+                    fg_is_straight,
                 )
             else:
                 result = self._postprocess_cpu(
-                    pred_alpha, pred_fg, h, w,
-                    auto_despeckle, despeckle_size,
-                    despill_strength, fg_is_straight,
+                    pred_alpha,
+                    pred_fg,
+                    h,
+                    w,
+                    auto_despeckle,
+                    despeckle_size,
+                    despill_strength,
+                    fg_is_straight,
                 )
 
         # === Finalize metrics ===
@@ -446,12 +636,9 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Single tensor creation + GPU upload (minimal GIL time)
         # Combine dtype + device into one .to() call to avoid intermediate copy
-        inp_t = (
-            torch.as_tensor(inp_hwc4)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(device=self.device, dtype=self.config.model_dtype, non_blocking=True)
-        )
+        inp_cpu = torch.as_tensor(inp_hwc4).permute(2, 0, 1).unsqueeze(0)
+        inp_t = inp_cpu.to(device=self.device, dtype=self.config.model_dtype, non_blocking=True)
+        # inp_cpu ref keeps numpy backing alive during async H2D DMA
 
         if _timings is not None:
             if self.device.type == "cuda":
@@ -463,12 +650,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Inference (GIL released during CUDA kernels)
         self._refiner_scale = refiner_scale
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.config.effective_mixed_precision,
-        ):
-            out = self.model(inp_t)
+        out = self._run_forward(inp_t)
 
         if _timings is not None:
             if self.device.type == "cuda":
@@ -484,15 +666,25 @@ class _BaseCorridorKeyEngine(ABC):
         # Post-process (GPU path keeps data on device, includes .cpu() transfer)
         if self.device.type == "cuda":
             result = self._postprocess_gpu(
-                pred_alpha, pred_fg, orig_h, orig_w,
-                auto_despeckle, despeckle_size,
-                despill_strength, fg_is_straight,
+                pred_alpha,
+                pred_fg,
+                orig_h,
+                orig_w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
             )
         else:
             result = self._postprocess_cpu(
-                pred_alpha, pred_fg, orig_h, orig_w,
-                auto_despeckle, despeckle_size,
-                despill_strength, fg_is_straight,
+                pred_alpha,
+                pred_fg,
+                orig_h,
+                orig_w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
             )
 
         if _timings is not None:
@@ -522,20 +714,23 @@ class _BaseCorridorKeyEngine(ABC):
             ev_start.record(torch.cuda.current_stream(self.device))
         elif _timings is not None:
             import time as _time
+
             t0 = _time.perf_counter()
 
         # Upload raw decoded arrays to GPU
-        if not img_raw.flags['C_CONTIGUOUS']:
+        if not img_raw.flags["C_CONTIGUOUS"]:
             img_raw = np.ascontiguousarray(img_raw)
         img_t = torch.from_numpy(img_raw).to(
-            device=self.device, dtype=torch.float32,
+            device=self.device,
+            dtype=torch.float32,
         )
         img_t = img_t.permute(2, 0, 1).unsqueeze(0)
 
-        if not mask_raw.flags['C_CONTIGUOUS']:
+        if not mask_raw.flags["C_CONTIGUOUS"]:
             mask_raw = np.ascontiguousarray(mask_raw)
         mask_t = torch.from_numpy(mask_raw).to(
-            device=self.device, dtype=torch.float32,
+            device=self.device,
+            dtype=torch.float32,
         )
         mask_t = mask_t.unsqueeze(0).unsqueeze(0)
 
@@ -558,12 +753,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Forward pass
         self._refiner_scale = refiner_scale
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.config.effective_mixed_precision,
-        ):
-            out = self.model(inp_t)
+        out = self._run_forward(inp_t)
 
         if use_events:
             ev_forward.record(torch.cuda.current_stream(self.device))
@@ -572,6 +762,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Build timing state for _finish_raw_timings
         import time as _time_mod
+
         t_post0 = _time_mod.perf_counter() if _timings is not None else 0
 
         if use_events:
@@ -589,6 +780,7 @@ class _BaseCorridorKeyEngine(ABC):
         if _timings is None or ts is None:
             return
         import time as _time_mod
+
         if ts[0] == "events":
             _, ev_start, ev_preprocess, ev_forward, t_post0 = ts
             _timings["preprocess"] = ev_start.elapsed_time(ev_preprocess) / 1000.0
@@ -621,7 +813,11 @@ class _BaseCorridorKeyEngine(ABC):
         reducing CPU→GPU transfer size and eliminating CPU-bound preprocessing.
         """
         out, use_cuda, ts = self._forward_raw(
-            img_raw, mask_raw, input_is_linear, refiner_scale, _timings,
+            img_raw,
+            mask_raw,
+            input_is_linear,
+            refiner_scale,
+            _timings,
         )
 
         pred_alpha = out["alpha"]
@@ -629,15 +825,25 @@ class _BaseCorridorKeyEngine(ABC):
 
         if use_cuda:
             result = self._postprocess_gpu(
-                pred_alpha, pred_fg, orig_h, orig_w,
-                auto_despeckle, despeckle_size,
-                despill_strength, fg_is_straight,
+                pred_alpha,
+                pred_fg,
+                orig_h,
+                orig_w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
             )
         else:
             result = self._postprocess_cpu(
-                pred_alpha, pred_fg, orig_h, orig_w,
-                auto_despeckle, despeckle_size,
-                despill_strength, fg_is_straight,
+                pred_alpha,
+                pred_fg,
+                orig_h,
+                orig_w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
             )
 
         self._finish_raw_timings(_timings, ts)
@@ -670,7 +876,11 @@ class _BaseCorridorKeyEngine(ABC):
         # and defeats the purpose of deferring.  The inference worker's
         # profiler captures wall-clock timings independently.
         out, use_cuda, ts = self._forward_raw(
-            img_raw, mask_raw, input_is_linear, refiner_scale, None,
+            img_raw,
+            mask_raw,
+            input_is_linear,
+            refiner_scale,
+            None,
         )
 
         pred_alpha = out["alpha"]
@@ -678,18 +888,28 @@ class _BaseCorridorKeyEngine(ABC):
 
         if use_cuda:
             pending = self._postprocess_gpu(
-                pred_alpha, pred_fg, orig_h, orig_w,
-                auto_despeckle, despeckle_size,
-                despill_strength, fg_is_straight,
+                pred_alpha,
+                pred_fg,
+                orig_h,
+                orig_w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
                 sync=False,
             )
         else:
             result = self._postprocess_cpu(
-                pred_alpha, pred_fg, orig_h, orig_w,
-                auto_despeckle, despeckle_size,
-                despill_strength, fg_is_straight,
+                pred_alpha,
+                pred_fg,
+                orig_h,
+                orig_w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
             )
-            pending = PendingTransfer(None, None, result)
+            pending = PendingTransfer(None, None, result, None)
 
         self._finish_raw_timings(_timings, ts)
         return pending
@@ -738,15 +958,15 @@ class _BaseCorridorKeyEngine(ABC):
         # All frames go to GPU individually (each may have different orig
         # resolution), then get resized to model size and stacked.
         img_batch = []
-        mask_batch = []
+        _mask_batch = []
         orig_sizes = []
         for img_raw, mask_raw, orig_h, orig_w in frames:
-            if not img_raw.flags['C_CONTIGUOUS']:
+            if not img_raw.flags["C_CONTIGUOUS"]:
                 img_raw = np.ascontiguousarray(img_raw)
             img_t = torch.from_numpy(img_raw).to(device=self.device, dtype=torch.float32)
             img_t = img_t.permute(2, 0, 1).unsqueeze(0)
 
-            if not mask_raw.flags['C_CONTIGUOUS']:
+            if not mask_raw.flags["C_CONTIGUOUS"]:
                 mask_raw = np.ascontiguousarray(mask_raw)
             mask_t = torch.from_numpy(mask_raw).to(device=self.device, dtype=torch.float32)
             mask_t = mask_t.unsqueeze(0).unsqueeze(0)
@@ -769,10 +989,14 @@ class _BaseCorridorKeyEngine(ABC):
         # (zero recompilation).  Padding frames are zeros — harmless through
         # the model, and sliced off before postprocess.
         target_B = self.max_batch_size()
-        if B < target_B:
+        if target_B > B:
             padding = torch.zeros(
-                target_B - B, 4, self.img_size, self.img_size,
-                device=self.device, dtype=inp_t.dtype,
+                target_B - B,
+                4,
+                self.img_size,
+                self.img_size,
+                device=self.device,
+                dtype=inp_t.dtype,
             )
             inp_t = torch.cat([inp_t, padding], dim=0)
 
@@ -785,12 +1009,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # === Forward: one pass for the entire (padded) batch ===
         self._refiner_scale = refiner_scale
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.config.effective_mixed_precision,
-        ):
-            out = self.model(inp_t)
+        out = self._run_forward(inp_t)
 
         if use_events:
             ev_forward.record(torch.cuda.current_stream(self.device))
@@ -803,25 +1022,33 @@ class _BaseCorridorKeyEngine(ABC):
         # Discard padding frames, then resize each independently (frames
         # may have different original resolutions).
         pred_alpha = out["alpha"][:B]  # [B, 1, model_h, model_w]
-        pred_fg = out["fg"][:B]        # [B, 3, model_h, model_w]
+        pred_fg = out["fg"][:B]  # [B, 3, model_h, model_w]
 
         results = []
         if use_cuda:
             for i in range(B):
                 result = self._postprocess_gpu(
-                    pred_alpha[i:i+1], pred_fg[i:i+1],
-                    orig_sizes[i][0], orig_sizes[i][1],
-                    auto_despeckle, despeckle_size,
-                    despill_strength, fg_is_straight,
+                    pred_alpha[i : i + 1],
+                    pred_fg[i : i + 1],
+                    orig_sizes[i][0],
+                    orig_sizes[i][1],
+                    auto_despeckle,
+                    despeckle_size,
+                    despill_strength,
+                    fg_is_straight,
                 )
                 results.append(result)
         else:
             for i in range(B):
                 result = self._postprocess_cpu(
-                    pred_alpha[i:i+1], pred_fg[i:i+1],
-                    orig_sizes[i][0], orig_sizes[i][1],
-                    auto_despeckle, despeckle_size,
-                    despill_strength, fg_is_straight,
+                    pred_alpha[i : i + 1],
+                    pred_fg[i : i + 1],
+                    orig_sizes[i][0],
+                    orig_sizes[i][1],
+                    auto_despeckle,
+                    despeckle_size,
+                    despill_strength,
+                    fg_is_straight,
                 )
                 results.append(result)
 
@@ -866,7 +1093,7 @@ class _BaseCorridorKeyEngine(ABC):
         #   - Intermediate features: ~300 MB
         # Total ~2 GB per frame in batch
         per_frame_mb = 2048
-        available_mb = (free * 0.7) / (1024 ** 2)
+        available_mb = (free * 0.7) / (1024**2)
         batch = max(1, int(available_mb / per_frame_mb))
         return min(batch, 8)  # cap at 8
 
@@ -874,7 +1101,8 @@ class _BaseCorridorKeyEngine(ABC):
         self,
         pred_alpha: torch.Tensor,
         pred_fg: torch.Tensor,
-        h: int, w: int,
+        h: int,
+        w: int,
         auto_despeckle: bool,
         despeckle_size: int,
         despill_strength: float,
@@ -894,7 +1122,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Convert to HWC on GPU
         res_alpha = alpha_up[0].permute(1, 2, 0)  # [H, W, 1]
-        res_fg = fg_up[0].permute(1, 2, 0)        # [H, W, 3]
+        res_fg = fg_up[0].permute(1, 2, 0)  # [H, W, 3]
 
         # A. Clean matte
         if auto_despeckle:
@@ -936,9 +1164,15 @@ class _BaseCorridorKeyEngine(ABC):
         bulk = torch.cat([res_alpha, res_fg, comp_srgb, processed_rgba], dim=-1)
 
         if self._copy_stream is not None:
-            # Select pinned buffer and toggle index for next call
+            # Select pinned buffer and rotate index for next call
             idx = self._pinned_idx
-            self._pinned_idx = 1 - self._pinned_idx
+            self._pinned_idx = (self._pinned_idx + 1) % self._num_pinned
+
+            # Wait for drain to finish copying from this slot before reuse.
+            # With triple buffering this almost never blocks (the slot was
+            # used 3 frames ago), but guarantees correctness if drain lags.
+            self._pinned_released[idx].wait()
+            self._pinned_released[idx].clear()
 
             # Reallocate this buffer slot if shape changed
             if self._pinned_shapes[idx] != bulk.shape:
@@ -948,40 +1182,46 @@ class _BaseCorridorKeyEngine(ABC):
             pinned = self._pinned_bufs[idx]
 
             # Wait for compute to finish, then async DMA on copy stream
-            event = torch.cuda.current_stream(self.device).record_event()
-            self._copy_stream.wait_event(event)
+            compute_event = torch.cuda.current_stream(self.device).record_event()
+            self._copy_stream.wait_event(compute_event)
             with torch.cuda.stream(self._copy_stream):
                 pinned.copy_(bulk, non_blocking=True)
 
             if not sync:
-                return PendingTransfer(self._copy_stream, pinned, None)
+                # Record event right after this DMA so resolve() waits
+                # only for THIS transfer, not later ones that may reuse
+                # the same pinned buffer.
+                dma_event = self._copy_stream.record_event()
+                return PendingTransfer(dma_event, pinned, None, self._pinned_released[idx], bulk)
 
             # Sync path: block until DMA completes, return numpy with .copy()
             self._copy_stream.synchronize()
             bulk_np = pinned.numpy()
-            return {
+            result = {
                 "alpha": bulk_np[:, :, 0:1].copy(),
                 "fg": bulk_np[:, :, 1:4].copy(),
                 "comp": bulk_np[:, :, 4:7].copy(),
                 "processed": bulk_np[:, :, 7:11].copy(),
             }
-        else:
-            bulk_np = bulk.cpu().numpy()
-            result = {
-                "alpha": bulk_np[:, :, 0:1],
-                "fg": bulk_np[:, :, 1:4],
-                "comp": bulk_np[:, :, 4:7],
-                "processed": bulk_np[:, :, 7:11],
-            }
-            if not sync:
-                return PendingTransfer(None, None, result)
+            self._pinned_released[idx].set()
             return result
+        bulk_np = bulk.cpu().numpy()
+        result = {
+            "alpha": bulk_np[:, :, 0:1],
+            "fg": bulk_np[:, :, 1:4],
+            "comp": bulk_np[:, :, 4:7],
+            "processed": bulk_np[:, :, 7:11],
+        }
+        if not sync:
+            return PendingTransfer(None, None, result, None)
+        return result
 
     def _postprocess_cpu(
         self,
         pred_alpha: torch.Tensor,
         pred_fg: torch.Tensor,
-        h: int, w: int,
+        h: int,
+        w: int,
         auto_despeckle: bool,
         despeckle_size: int,
         despill_strength: float,

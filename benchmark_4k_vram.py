@@ -37,12 +37,16 @@ NUM_FRAMES = 100  # first 100 frames from the sequence
 
 CONFIGS: list[tuple[str, dict, str]] = [
     ("Flash Attention Only (baseline)", {"flash_attention": True}, "baseline"),
-    ("All Optimizations", {
-        "flash_attention": True,
-        "tiled_refiner": True,
-        "disable_cudnn_benchmark": True,
-        "cache_clearing": True,
-    }, "optimized"),
+    (
+        "All Optimizations",
+        {
+            "flash_attention": True,
+            "tiled_refiner": True,
+            "disable_cudnn_benchmark": True,
+            "cache_clearing": True,
+        },
+        "optimized",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -136,7 +140,12 @@ else:
 
 # ---- Discover EXR frames and alpha hints ----
 exr_files = sorted(glob.glob(os.path.join(frames_dir, "*.exr")))[:num_frames]
-hint_files = sorted([f for f in os.listdir(hint_dir) if f.lower().endswith(('.png', '.exr', '.jpg', '.tif', '.tiff'))]) if os.path.isdir(hint_dir) else []
+_hint_exts = ('.png', '.exr', '.jpg', '.tif', '.tiff')
+hint_files = (
+    sorted([f for f in os.listdir(hint_dir) if f.lower().endswith(_hint_exts)])
+    if os.path.isdir(hint_dir)
+    else []
+)
 total_frames = len(exr_files)
 
 if total_frames == 0:
@@ -337,15 +346,23 @@ print(json.dumps(result))
 
 
 def run_config(label: str, config_fields: dict, tag: str) -> dict:
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  BENCHMARK: {label}")
     print(f"  Processing {NUM_FRAMES} 4K EXR frames (Tears of Steel)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     config_json = json.dumps(config_fields)
     cmd = [
-        sys.executable, "-c", WORKER_SCRIPT,
-        config_json, CKPT, FRAMES_DIR, OUTPUT_DIR, tag, HINT_DIR, str(NUM_FRAMES),
+        sys.executable,
+        "-c",
+        WORKER_SCRIPT,
+        config_json,
+        CKPT,
+        FRAMES_DIR,
+        OUTPUT_DIR,
+        tag,
+        HINT_DIR,
+        str(NUM_FRAMES),
     ]
 
     start = time.time()
@@ -380,8 +397,10 @@ def run_config(label: str, config_fields: dict, tag: str) -> dict:
         fps = result.get("effective_fps", 0)
         device_peak = result.get("device_peak_gpu_mb", 0)
         total = result.get("overall_time_s", 0)
-        print(f"\n  DONE: {result.get('frames_processed',0)} frames in {total:.1f}s "
-              f"({fps:.2f} fps) | Device peak: {device_peak:.0f} MB")
+        print(
+            f"\n  DONE: {result.get('frames_processed', 0)} frames in {total:.1f}s "
+            f"({fps:.2f} fps) | Device peak: {device_peak:.0f} MB"
+        )
     else:
         print(f"\n  {status}: {result.get('error', 'unknown')[:100]}")
 
@@ -397,17 +416,19 @@ def generate_report(results: list[dict], gpu_info: str) -> str:
     L.append("")
     L.append("## Test Configuration")
     L.append("")
-    L.append("- **Source footage**: Tears of Steel (scene 02_3c) — CC-BY 3.0 (c) Blender Foundation | mango.blender.org")
+    L.append(
+        "- **Source footage**: Tears of Steel (scene 02_3c) — CC-BY 3.0 (c) Blender Foundation | mango.blender.org"
+    )
     L.append("- **Format**: OpenEXR 16-bit half-float, linear color space")
     L.append("- **Resolution**: 4096x2160 (DCI 4K)")
-    L.append(f"- **Frames**: {NUM_FRAMES} (24 fps, ~{NUM_FRAMES/24:.1f} seconds)")
+    L.append(f"- **Frames**: {NUM_FRAMES} (24 fps, ~{NUM_FRAMES / 24:.1f} seconds)")
     L.append("- **Model input size**: 2048x2048")
     L.append(f"- **GPU**: {gpu_info}")
     L.append("- **Alpha hints**: HSV chroma key (auto-generated from green screen footage)")
     L.append("- **Color pipeline**: `input_is_linear=True` — engine handles linear→sRGB conversion internally")
     L.append("")
     L.append("> **Note**: The original engine OOMs at 4K on 8 GB GPUs. Flash Attention is the")
-    L.append("> minimum required optimization. The \"baseline\" config uses Flash Attention only")
+    L.append('> minimum required optimization. The "baseline" config uses Flash Attention only')
     L.append("> to serve as the closest proxy to original behavior while remaining runnable.")
     L.append("")
 
@@ -463,18 +484,18 @@ def generate_report(results: list[dict], gpu_info: str) -> str:
 
         L.append("")
         if b_spillover > 0 or o_spillover > 0:
-            L.append(f"> **Shared GPU memory spillover (system RAM):** The baseline's PyTorch allocator")
+            L.append("> **Shared GPU memory spillover (system RAM):** The baseline's PyTorch allocator")
             L.append(f"> reserved **{b_reserved:.0f} MB** but the GPU only has **{b_total_gpu:.0f} MB** of")
             L.append(f"> dedicated VRAM — meaning **~{b_spillover:.0f} MB spilled into shared GPU memory**")
-            L.append(f"> (system RAM accessed over PCIe). This is drastically slower than dedicated VRAM")
-            L.append(f"> and is a major contributor to the baseline's poor performance. The device-level")
+            L.append("> (system RAM accessed over PCIe). This is drastically slower than dedicated VRAM")
+            L.append("> and is a major contributor to the baseline's poor performance. The device-level")
             L.append(f"> peak is capped at {b_total_gpu:.0f} MB because `torch.cuda.mem_get_info()` cannot")
-            L.append(f"> see beyond physical VRAM.")
+            L.append("> see beyond physical VRAM.")
             if o_spillover > 0:
-                L.append(f">")
+                L.append(">")
                 L.append(f"> The optimized config also spilled **~{o_spillover:.0f} MB** into shared memory.")
             else:
-                L.append(f">")
+                L.append(">")
                 L.append(f"> The optimized config reserved only **{o_reserved:.0f} MB** — well within the")
                 L.append(f"> {o_total_gpu:.0f} MB physical VRAM with **{o_total_gpu - o_reserved:.0f} MB headroom**.")
             L.append("")
@@ -550,13 +571,17 @@ def generate_report(results: list[dict], gpu_info: str) -> str:
         speedup = ((b_time - o_time) / b_time * 100) if b_time else 0
 
         L.append(f"Processing {NUM_FRAMES} frames of 4K EXR footage (Tears of Steel):")
-        L.append(f"")
-        L.append(f"- **Speed**: {o_fps:.2f} fps optimized vs {b_fps:.2f} fps baseline "
-                 f"({'faster' if o_time < b_time else 'slower'} by {abs(speedup):.1f}%)")
-        L.append(f"- **Reserved VRAM**: {o_reserved:.0f} MB optimized vs {b_reserved:.0f} MB baseline "
-                 f"(**-{reserved_reduction:.0f}%**)")
+        L.append("")
+        L.append(
+            f"- **Speed**: {o_fps:.2f} fps optimized vs {b_fps:.2f} fps baseline "
+            f"({'faster' if o_time < b_time else 'slower'} by {abs(speedup):.1f}%)"
+        )
+        L.append(
+            f"- **Reserved VRAM**: {o_reserved:.0f} MB optimized vs {b_reserved:.0f} MB baseline "
+            f"(**-{reserved_reduction:.0f}%**)"
+        )
         L.append(f"- **Total time**: {o_time:.1f}s optimized vs {b_time:.1f}s baseline")
-        L.append(f"")
+        L.append("")
         L.append(f"The optimizations reduce CUDA reserved memory by **{reserved_reduction:.0f}%** while ")
 
         if o_time < b_time:
@@ -571,6 +596,7 @@ def generate_report(results: list[dict], gpu_info: str) -> str:
 
 def main():
     import shutil
+
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
         print(f"Cleared {OUTPUT_DIR}/")
@@ -585,6 +611,7 @@ def main():
         sys.exit(1)
     # Count available frames
     import glob as _glob
+
     available_frames = len(_glob.glob(os.path.join(FRAMES_DIR, "*.exr")))
     if available_frames < NUM_FRAMES:
         print(f"WARNING: Only {available_frames} EXR frames available (need {NUM_FRAMES})")
@@ -593,7 +620,7 @@ def main():
         print(f"ERROR: Alpha hint directory not found: {HINT_DIR}")
         print("Run: uv run python tears_of_steel_test/generate_alpha_hints.py")
         sys.exit(1)
-    hint_count = len([f for f in os.listdir(HINT_DIR) if f.lower().endswith(('.png', '.exr', '.jpg'))])
+    hint_count = len([f for f in os.listdir(HINT_DIR) if f.lower().endswith((".png", ".exr", ".jpg"))])
     if hint_count == 0:
         print(f"ERROR: No alpha hints found in {HINT_DIR}")
         print("Run: uv run python tears_of_steel_test/generate_alpha_hints.py")
@@ -601,6 +628,7 @@ def main():
 
     try:
         import torch
+
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         gpu_info = f"{gpu_name} ({gpu_mem:.1f} GB)"
@@ -625,19 +653,21 @@ def main():
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(report)
 
-    print(f"\n\n{'='*60}")
-    print(f"  BENCHMARK COMPLETE")
+    print(f"\n\n{'=' * 60}")
+    print("  BENCHMARK COMPLETE")
     print(f"  Report: {REPORT_PATH}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     for r in results:
         if r.get("status") == "OK":
             print(f"  {r['label']}:")
-            print(f"    {r.get('effective_fps',0):.2f} fps | "
-                  f"{r.get('overall_time_s',0):.1f}s total | "
-                  f"Device peak: {r.get('device_peak_gpu_mb',0):.0f} MB | "
-                  f"Allocator reserved: {r.get('peak_vram_reserved_mb',0):.0f} MB")
-            print(f"    Outputs: {r.get('comp_output','')}, {r.get('alpha_output','')}")
+            print(
+                f"    {r.get('effective_fps', 0):.2f} fps | "
+                f"{r.get('overall_time_s', 0):.1f}s total | "
+                f"Device peak: {r.get('device_peak_gpu_mb', 0):.0f} MB | "
+                f"Allocator reserved: {r.get('peak_vram_reserved_mb', 0):.0f} MB"
+            )
+            print(f"    Outputs: {r.get('comp_output', '')}, {r.get('alpha_output', '')}")
 
 
 if __name__ == "__main__":

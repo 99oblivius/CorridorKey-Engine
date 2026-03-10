@@ -9,9 +9,8 @@ Usage:
 """
 
 import os
-import sys
-import urllib.request
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_URL = "https://media.xiph.org/tearsofsteel/tearsofsteel-footage-exr/02_3c/linear/"
@@ -42,10 +41,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Check how many already exist
-    existing = sum(
-        1 for i in range(NUM_FRAMES)
-        if os.path.exists(os.path.join(OUTPUT_DIR, f"02_3c_{i:05d}.exr"))
-    )
+    existing = sum(1 for i in range(NUM_FRAMES) if os.path.exists(os.path.join(OUTPUT_DIR, f"02_3c_{i:05d}.exr")))
     if existing == NUM_FRAMES:
         print(f"All {NUM_FRAMES} frames already downloaded in {OUTPUT_DIR}")
         return
@@ -63,10 +59,7 @@ def main():
     failed = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(download_frame, i): i
-            for i in range(NUM_FRAMES)
-        }
+        futures = {executor.submit(download_frame, i): i for i in range(NUM_FRAMES)}
         for future in as_completed(futures):
             idx, success, msg = future.result()
             completed += 1
@@ -77,8 +70,7 @@ def main():
                 elapsed = time.time() - start
                 rate = completed / elapsed if elapsed > 0 else 0
                 eta = (NUM_FRAMES - completed) / rate if rate > 0 else 0
-                print(f"  [{completed}/{NUM_FRAMES}] frame {idx:05d}: {msg}  "
-                      f"({rate:.1f} frames/s, ETA {eta:.0f}s)")
+                print(f"  [{completed}/{NUM_FRAMES}] frame {idx:05d}: {msg}  ({rate:.1f} frames/s, ETA {eta:.0f}s)")
 
     elapsed = time.time() - start
     print(f"\nDone in {elapsed:.1f}s. Downloaded: {completed - failed}, Failed: {failed}")

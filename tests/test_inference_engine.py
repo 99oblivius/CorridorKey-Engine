@@ -43,6 +43,11 @@ def _make_engine_with_mock(mock_greenformer, img_size=64):
     engine._checker_cache = {}
     engine._refiner_scale = 1.0
     engine._refiner_hook_handle = None
+    engine._cuda_graph = None
+    engine._graph_input = None
+    engine._graph_output = None
+    engine._use_trt = False
+    engine._trt_model = None
     engine.model = mock_greenformer
     return engine
 

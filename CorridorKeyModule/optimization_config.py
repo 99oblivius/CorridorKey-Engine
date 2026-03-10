@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 from dataclasses import dataclass, field
 
 import torch
@@ -69,6 +73,26 @@ class OptimizationConfig:
     disabled by default because the trained attention weights expect all
     tokens to participate."""
 
+    compile_mode: str = "default"
+    """``torch.compile`` mode passed as the ``mode=`` argument.  Valid
+    values: ``'default'``, ``'reduce-overhead'``, ``'max-autotune'``,
+    ``'max-autotune-no-cudagraphs'``.  Higher modes increase first-run
+    compilation time but produce faster kernels.  The FX graph cache
+    stores autotuned results so the cost is paid once."""
+
+    cuda_graphs: bool = False
+    """Enable manual CUDA graph capture for the model forward pass.
+    Requires fixed input shapes (satisfied by ``img_size``) and is
+    incompatible with ``cache_clearing`` (automatically disabled).
+    Only effective on CUDA devices with 12+ GB VRAM."""
+
+    tensorrt: bool = False
+    """Use TensorRT via ``torch_tensorrt.compile()`` for optimized
+    inference with fused kernels and tensor core utilization.  Requires
+    the ``torch-tensorrt`` package.  Falls back to ``torch.compile`` on
+    failure.  Incompatible with ``cuda_graphs`` (TensorRT manages its
+    own graph capture internally)."""
+
     # --- Tiling parameters ---
 
     tile_size: int = 512
@@ -105,6 +129,19 @@ class OptimizationConfig:
         """Resolve :attr:`model_precision` string to a ``torch.dtype``."""
         _MAP = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
         return _MAP.get(self.model_precision, torch.float32)
+
+    @property
+    def effective_cache_clearing(self) -> bool:
+        """Whether ``empty_cache()`` calls should actually run.
+
+        Cache clearing is force-disabled when CUDA graphs are active
+        (either manual or via ``max-autotune`` / ``reduce-overhead``
+        compile modes) because ``cudaFree`` is illegal inside a
+        captured graph.
+        """
+        if self.cuda_graphs or self.compile_mode in ("max-autotune", "reduce-overhead"):
+            return False
+        return self.cache_clearing
 
     @property
     def effective_mixed_precision(self) -> bool:
@@ -157,6 +194,24 @@ class OptimizationConfig:
         )
 
     @classmethod
+    def performance(cls) -> OptimizationConfig:
+        """Maximum throughput -- disables cache clearing, enables
+        autotuning and CUDA graphs.  Requires 12+ GB VRAM at 2048x2048.
+        Uses full-resolution refiner and cuDNN benchmarking for fastest
+        kernel selection."""
+        return cls(
+            flash_attention=True,
+            tiled_refiner=False,
+            disable_cudnn_benchmark=False,
+            cache_clearing=False,
+            mixed_precision=True,
+            model_precision="float16",
+            high_matmul_precision=True,
+            token_routing=False,
+            compile_mode="max-autotune",
+        )
+
+    @classmethod
     def from_profile(cls, name: str) -> OptimizationConfig:
         """Resolve a named profile string to an ``OptimizationConfig``.
 
@@ -167,6 +222,7 @@ class OptimizationConfig:
             "original": cls.original,
             "optimized": cls.optimized,
             "experimental": cls.experimental,
+            "performance": cls.performance,
         }
         if name not in profiles:
             raise ValueError(f"Unknown optimization profile '{name}'. Valid profiles: {', '.join(profiles)}")
@@ -195,6 +251,12 @@ class OptimizationConfig:
             names.append("tf32_matmul")
         if self.token_routing:
             names.append(f"token_routing(edge={self.edge_threshold_low}-{self.edge_threshold_high})")
+        if self.compile_mode != "default":
+            names.append(f"compile_{self.compile_mode}")
+        if self.cuda_graphs:
+            names.append("cuda_graphs")
+        if self.tensorrt:
+            names.append("tensorrt")
         return names
 
     def summary(self) -> str:
@@ -233,7 +295,7 @@ class PerformanceMetrics:
     peak_vram_mb: float = 0.0
 
     @contextmanager
-    def measure(self, stage_name: str, device: torch.device):
+    def measure(self, stage_name: str, device: torch.device) -> Generator[StageMetric, None, None]:
         """Context manager that records timing and VRAM for *stage_name*.
 
         Example::

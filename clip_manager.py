@@ -15,11 +15,12 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
 import numpy as np
 
+from backend.natural_sort import natsorted
 from device_utils import resolve_device
 
 if TYPE_CHECKING:
-    from gvm_core import GVMProcessor
     from birefnet_core import BiRefNetProcessor
+    from gvm_core import GVMProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class ClipAsset:
 
     def _calculate_length(self) -> None:
         if self.type == "sequence":
-            files = sorted([f for f in os.listdir(self.path) if is_image_file(f)])
+            files = natsorted([f for f in os.listdir(self.path) if is_image_file(f)])
             self.frame_count = len(files)
         elif self.type == "video":
             cap = cv2.VideoCapture(self.path)
@@ -162,12 +163,11 @@ class ClipEntry:
                 self.alpha_asset = None  # Missing, needs generation
 
     def validate_pair(self) -> None:
-        if self.input_asset and self.alpha_asset:
-            if self.input_asset.frame_count != self.alpha_asset.frame_count:
-                raise ValueError(
-                    f"Clip '{self.name}': Frame count mismatch! "
-                    f"Input: {self.input_asset.frame_count}, Alpha: {self.alpha_asset.frame_count}"
-                )
+        if self.input_asset and self.alpha_asset and self.input_asset.frame_count != self.alpha_asset.frame_count:
+            raise ValueError(
+                f"Clip '{self.name}': Frame count mismatch! "
+                f"Input: {self.input_asset.frame_count}, Alpha: {self.alpha_asset.frame_count}"
+            )
 
 
 # --- Logic ---
@@ -186,7 +186,7 @@ def get_gvm_processor(device: str = "cpu") -> GVMProcessor:
         raise RuntimeError(f"Failed to initialize GVM Processor: {e}") from e
 
 
-def generate_alphas(clips, device=None):
+def generate_alphas(clips: list[ClipEntry], device: str | None = None) -> None:
     clips_to_process = [c for c in clips if c.alpha_asset is None]
 
     if not clips_to_process:
@@ -229,14 +229,14 @@ def generate_alphas(clips, device=None):
             )
 
             # Post-Process: Naming Convention
-            generated_files = sorted([f for f in os.listdir(alpha_output_dir) if f.endswith(".png")])
+            generated_files = natsorted([f for f in os.listdir(alpha_output_dir) if f.endswith(".png")])
 
             if not generated_files:
                 logger.error(f"GVM finished but no PNGs found in {alpha_output_dir}")
                 continue
 
             if clip.input_asset.type == "sequence":
-                in_files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
+                in_files = natsorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
                 stems = [os.path.splitext(f)[0] for f in in_files]
             else:
                 base_name = os.path.splitext(os.path.basename(clip.input_asset.path))[0]
@@ -271,13 +271,14 @@ def get_birefnet_processor(device: str = "cpu") -> BiRefNetProcessor:
         return BiRefNetProcessor(device=device)
     except ImportError:
         raise ImportError(
-            "Could not import birefnet_core. Please ensure 'birefnet_core' is in the project root and requirements are installed."
+            "Could not import birefnet_core. Please ensure 'birefnet_core' is in the project root"
+            " and requirements are installed."
         ) from None
     except Exception as e:
         raise RuntimeError(f"Failed to initialize BiRefNet Processor: {e}") from e
 
 
-def generate_alphas_birefnet(clips, device=None):
+def generate_alphas_birefnet(clips: list[ClipEntry], device: str | None = None) -> None:
     """Generate coarse alpha hints using BiRefNet salient object segmentation.
 
     This is a lightweight alternative to GVM that runs on consumer GPUs (~4 GB VRAM).
@@ -297,7 +298,9 @@ def generate_alphas_birefnet(clips, device=None):
         processor = get_birefnet_processor(device=device)
     except ImportError as e:
         logger.error(f"BiRefNet Import Error: {e}")
-        logger.error("Skipping BiRefNet generation. Please install BiRefNet requirements if you wish to use this feature.")
+        logger.error(
+            "Skipping BiRefNet generation. Please install BiRefNet requirements if you wish to use this feature."
+        )
         return
     except Exception as e:
         logger.error(f"BiRefNet Initialization Error: {e}")
@@ -370,9 +373,7 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
         # Store for later
         clip_mask_paths[c.name] = mask_asset_path
 
-        if c.alpha_asset is None:
-            clips_to_process.append(c)
-        elif c.alpha_asset.type == "video":
+        if c.alpha_asset is None or c.alpha_asset.type == "video":
             clips_to_process.append(c)
 
     if not clips_to_process:
@@ -418,7 +419,7 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
                 input_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             cap.release()
         else:
-            files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
+            files = natsorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
             for f in files:
                 fpath = os.path.join(clip.input_asset.path, f)
                 # Handle EXR (Float 0-1) vs Standard (Int 0-255)
@@ -448,7 +449,7 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
         # Check if VideoMamaMaskHint is a directory or a file (video)
         if os.path.isdir(mask_hint_path):
             # Directory of Images
-            mask_files = sorted([f for f in os.listdir(mask_hint_path) if is_image_file(f)])
+            mask_files = natsorted([f for f in os.listdir(mask_hint_path) if is_image_file(f)])
             for f in mask_files:
                 fpath = os.path.join(mask_hint_path, f)
                 m = None
@@ -520,7 +521,7 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
 
             # Name setup
             if clip.input_asset.type == "sequence":
-                in_names = sorted(
+                in_names = natsorted(
                     [os.path.splitext(f)[0] for f in os.listdir(clip.input_asset.path) if is_image_file(f)]
                 )
             else:
@@ -561,6 +562,7 @@ def _extract_video_frames(video_path: str, output_dir: str, max_frames: int | No
     os.makedirs(output_dir, exist_ok=True)
     try:
         from backend.ffmpeg_tools import extract_frames
+
         extract_frames(
             video_path,
             output_dir,
@@ -581,13 +583,23 @@ def _extract_video_frames(video_path: str, output_dir: str, max_frames: int | No
             idx += 1
         cap.release()
 
-    paths = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+    paths = natsorted(glob.glob(os.path.join(output_dir, "*.png")))
     if max_frames is not None:
         paths = paths[:max_frames]
     return paths
 
 
-def run_inference(clips, device=None, backend=None, max_frames=None, optimization_config=None, devices=None, img_size=2048, read_workers=0, write_workers=0):
+def run_inference(
+    clips: list[ClipEntry],
+    device: str | None = None,
+    backend: str | None = None,
+    max_frames: int | None = None,
+    optimization_config: object | None = None,
+    devices: list[str] | None = None,
+    img_size: int = 2048,
+    read_workers: int = 0,
+    write_workers: int = 0,
+) -> None:
     ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
 
     if not ready_clips:
@@ -597,7 +609,7 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
     logger.info(f"Found {len(ready_clips)} clips ready for inference.")
 
     # --- User Prompts ---
-    print("\n--- Inference Settings ---")
+    logger.info("\n--- Inference Settings ---")
 
     # 1. Gamma Prompt
     user_input_is_linear = False
@@ -646,7 +658,7 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
             refiner_scale = 1.0
     logger.info(f"User selected: Refiner Strength {refiner_scale}")
 
-    print("--------------------------\n")
+    logger.info("--------------------------\n")
 
     # Ensure Output Directory exists
     if not os.path.exists(OUTPUT_DIR):
@@ -655,7 +667,14 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
     # --- Initialize Async Pipeline ---
     from backend.async_pipeline import AsyncInferencePipeline, InferenceSettings, PipelineConfig
 
-    config = PipelineConfig(img_size=img_size, backend=backend, devices=devices, optimization_config=optimization_config, read_workers=read_workers, write_workers=write_workers)
+    config = PipelineConfig(
+        img_size=img_size,
+        backend=backend,
+        devices=devices,
+        optimization_config=optimization_config,
+        read_workers=read_workers,
+        write_workers=write_workers,
+    )
     pipeline = AsyncInferencePipeline(config)
     pipeline.load_engines()
 
@@ -706,7 +725,7 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
                 input_paths = extracted
                 input_stems = [f"{i:05d}" for i in range(len(extracted))]
             else:
-                input_files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
+                input_files = natsorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
                 input_paths = [os.path.join(clip.input_asset.path, f) for f in input_files[:num_frames]]
                 input_stems = [os.path.splitext(f)[0] for f in input_files[:num_frames]]
 
@@ -716,7 +735,7 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
                 logger.info("  Extracting alpha video frames...")
                 alpha_paths = _extract_video_frames(clip.alpha_asset.path, tmp_alpha, max_frames=num_frames)
             else:
-                alpha_files = sorted([f for f in os.listdir(clip.alpha_asset.path) if is_image_file(f)])
+                alpha_files = natsorted([f for f in os.listdir(clip.alpha_asset.path) if is_image_file(f)])
                 alpha_paths = [os.path.join(clip.alpha_asset.path, f) for f in alpha_files[:num_frames]]
 
             # Run pipeline
@@ -730,8 +749,7 @@ def run_inference(clips, device=None, backend=None, max_frames=None, optimizatio
             )
 
             logger.info(
-                f"Clip {clip.name} Complete: {result['completed']}/{result['total']} frames"
-                f" ({result['failed']} failed)"
+                f"Clip {clip.name} Complete: {result['completed']}/{result['total']} frames ({result['failed']} failed)"
             )
 
         finally:
@@ -756,7 +774,7 @@ def organize_target(target_dir: str) -> None:
     # Check for loose video
     # Strategy: Find largest video file that ISN'T named Input.*
     candidates = [f for f in os.listdir(target_dir) if is_video_file(f)]
-    candidates = [f for f in candidates if not os.path.splitext(f)[0].lower() == "input"]
+    candidates = [f for f in candidates if os.path.splitext(f)[0].lower() != "input"]
 
     if candidates and not os.path.exists(os.path.join(target_dir, "Input")):
         # If multiple, pick largest (heuristic for 'Main Plate')
@@ -778,7 +796,7 @@ def organize_target(target_dir: str) -> None:
     )
 
     if not has_input_dir and not has_input_video:
-        all_files = sorted(glob.glob(os.path.join(target_dir, "*")))
+        all_files = natsorted(glob.glob(os.path.join(target_dir, "*")))
         image_files = [f for f in all_files if is_image_file(f)]
 
         if len(image_files) > 0:
@@ -857,7 +875,7 @@ def scan_clips() -> list[ClipEntry]:
     invalid_clips = []
 
     for d in clip_dirs:
-        if d.startswith(".") or d.startswith("_") or d == "IgnoredClips":
+        if d.startswith((".", "_")) or d == "IgnoredClips":
             continue
 
         full_path = os.path.join(CLIPS_DIR, d)
@@ -873,21 +891,25 @@ def scan_clips() -> list[ClipEntry]:
             invalid_clips.append((d, f"Unexpected error: {e}"))
 
     if invalid_clips:
-        print("\n" + "=" * 60)
-        print(" INVALID OR SKIPPED CLIPS")
-        print("=" * 60)
+        logger.warning("\n" + "=" * 60)
+        logger.warning(" INVALID OR SKIPPED CLIPS")
+        logger.warning("=" * 60)
         for name, reason in invalid_clips:
-            print(f"- {name}: {reason}")
-        print("=" * 60 + "\n")
+            logger.warning("- %s: %s", name, reason)
+        logger.warning("=" * 60 + "\n")
     else:
-        print("\nAll clip folders appear valid.\n")
+        logger.info("\nAll clip folders appear valid.\n")
 
     return valid_clips
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
-    parser.add_argument("--action", choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"], required=True)
+    parser.add_argument(
+        "--action",
+        choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"],
+        required=True,
+    )
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
     parser.add_argument(
         "--device",
@@ -936,6 +958,6 @@ if __name__ == "__main__":
         run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames, devices=devices_list)
     elif args.action == "wizard":
         if not args.win_path:
-            print("Error: --win_path required for wizard.")
+            logger.error("Error: --win_path required for wizard.")
         else:
             raise NotImplementedError("interactive_wizard is not yet implemented")

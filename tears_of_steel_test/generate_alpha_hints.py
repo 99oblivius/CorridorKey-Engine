@@ -10,9 +10,9 @@ Usage:
     uv run python tears_of_steel_test/generate_alpha_hints.py
 """
 
+import glob
 import os
 import sys
-import glob
 import time
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
@@ -73,9 +73,7 @@ def generate_alpha_hint(frame_linear: np.ndarray) -> np.ndarray:
     fg_mask = cv2.bitwise_not(green_mask)
 
     # Erode slightly to under-predict foreground (model handles this better)
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (ERODE_KERNEL_SIZE, ERODE_KERNEL_SIZE)
-    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ERODE_KERNEL_SIZE, ERODE_KERNEL_SIZE))
     fg_mask = cv2.erode(fg_mask, kernel, iterations=1)
 
     # Gaussian blur to create soft/coarse edges
@@ -105,7 +103,7 @@ def main():
         else:
             to_process.append((exr_path, hint_path))
 
-    print(f"Alpha hint generation (HSV chroma key)")
+    print("Alpha hint generation (HSV chroma key)")
     print(f"  Frames dir: {FRAMES_DIR}")
     print(f"  Output dir: {OUTPUT_DIR}")
     print(f"  Total EXR frames: {len(exr_files)}")
@@ -138,7 +136,7 @@ def main():
             elapsed = time.time() - start
             rate = (i + 1) / elapsed
             eta = (len(to_process) - i - 1) / rate if rate > 0 else 0
-            print(f"  [{i+1}/{len(to_process)}] {rate:.1f} frames/s, ETA {eta:.0f}s")
+            print(f"  [{i + 1}/{len(to_process)}] {rate:.1f} frames/s, ETA {eta:.0f}s")
 
     elapsed = time.time() - start
     print(f"\nDone in {elapsed:.1f}s. Generated {len(to_process)} alpha hints.")

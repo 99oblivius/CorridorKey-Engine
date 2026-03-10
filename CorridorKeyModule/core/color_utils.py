@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _is_tensor(x: np.ndarray | torch.Tensor) -> bool:
@@ -38,8 +41,7 @@ def _clamp(x: np.ndarray | torch.Tensor, min: float) -> np.ndarray | torch.Tenso
     """
     if _is_tensor(x):
         return x.clamp(min=0.0)
-    else:
-        return np.clip(x, 0.0, None)
+    return np.clip(x, 0.0, None)
 
 
 _torch_stack = functools.partial(torch.stack, dim=-1)
@@ -138,8 +140,7 @@ def rgb_to_yuv(image: torch.Tensor) -> torch.Tensor:
 
     if image.dim() >= 3 and image.shape[-3] == 3:  # Concatenate along Channel dim
         return torch.cat([y, u, v], dim=-3)
-    else:
-        return torch.stack([y, u, v], dim=-1)
+    return torch.stack([y, u, v], dim=-1)
 
 
 def dilate_mask(mask: np.ndarray | torch.Tensor, radius: int) -> np.ndarray | torch.Tensor:
@@ -168,15 +169,14 @@ def dilate_mask(mask: np.ndarray | torch.Tensor, radius: int) -> np.ndarray | to
 
         if orig_dim == 2:
             return dilated.squeeze()
-        elif orig_dim == 3:
+        if orig_dim == 3:
             return dilated.squeeze(0)
         return dilated
-    else:
-        # Numpy Dilation (using OpenCV)
-        import cv2
+    # Numpy Dilation (using OpenCV)
+    import cv2
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        return cv2.dilate(mask, kernel)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(mask, kernel)
 
 
 def apply_garbage_matte(
@@ -262,7 +262,7 @@ def clean_matte(alpha_np: np.ndarray, area_threshold: int = 300, dilation: int =
     mask_8u = (alpha_np > 0.5).astype(np.uint8) * 255
 
     # Find connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_8u, connectivity=8)
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask_8u, connectivity=8)
 
     # Create an empty mask for the cleaned components
     cleaned_mask = np.zeros_like(mask_8u)

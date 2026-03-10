@@ -21,7 +21,10 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import numpy as np
 
@@ -89,7 +92,7 @@ class InferenceParams:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "InferenceParams":
+    def from_dict(cls, d: dict) -> InferenceParams:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
@@ -111,7 +114,7 @@ class OutputConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "OutputConfig":
+    def from_dict(cls, d: dict) -> OutputConfig:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
@@ -153,7 +156,7 @@ class CorridorKeyService:
             service.run_inference(clip, params, on_progress=my_callback)
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._engine = None
         self._gvm_processor = None
         self._videomama_pipeline = None
@@ -281,7 +284,7 @@ class CorridorKeyService:
 
         self._active_model = needed
 
-    def _get_engine(self):
+    def _get_engine(self) -> Any:
         """Lazy-load the CorridorKey inference engine via the backend factory."""
         self._ensure_model(_ActiveModel.INFERENCE)
 
@@ -299,7 +302,7 @@ class CorridorKeyService:
         logger.info(f"Engine loaded in {time.monotonic() - t0:.1f}s")
         return self._engine
 
-    def _get_gvm(self):
+    def _get_gvm(self) -> Any:
         """Lazy-load the GVM processor."""
         self._ensure_model(_ActiveModel.GVM)
 
@@ -314,7 +317,7 @@ class CorridorKeyService:
         logger.info(f"GVM loaded in {time.monotonic() - t0:.1f}s")
         return self._gvm_processor
 
-    def _get_videomama_pipeline(self):
+    def _get_videomama_pipeline(self) -> Any:
         """Lazy-load the VideoMaMa inference pipeline."""
         self._ensure_model(_ActiveModel.VIDEOMAMA)
 
@@ -389,12 +392,11 @@ class CorridorKeyService:
                 return None, input_stem, False
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             return img_rgb.astype(np.float32) / 255.0, input_stem, input_is_linear
-        else:
-            fpath = os.path.join(clip.input_asset.path, input_files[frame_index])
-            input_stem = os.path.splitext(input_files[frame_index])[0]
-            img = read_image_frame(fpath)
-            validate_frame_read(img, clip.name, frame_index, fpath)
-            return img, input_stem, input_is_linear
+        fpath = os.path.join(clip.input_asset.path, input_files[frame_index])
+        input_stem = os.path.splitext(input_files[frame_index])[0]
+        img = read_image_frame(fpath)
+        validate_frame_read(img, clip.name, frame_index, fpath)
+        return img, input_stem, input_is_linear
 
     def _read_alpha_frame(
         self,
@@ -409,11 +411,10 @@ class CorridorKeyService:
             if not ret:
                 return None
             return frame[:, :, 2].astype(np.float32) / 255.0
-        else:
-            fpath = os.path.join(clip.alpha_asset.path, alpha_files[frame_index])
-            mask = read_mask_frame(fpath, clip.name, frame_index)
-            validate_frame_read(mask, clip.name, frame_index, fpath)
-            return mask
+        fpath = os.path.join(clip.alpha_asset.path, alpha_files[frame_index])
+        mask = read_mask_frame(fpath, clip.name, frame_index)
+        validate_frame_read(mask, clip.name, frame_index, fpath)
+        return mask
 
     def _write_image(
         self,

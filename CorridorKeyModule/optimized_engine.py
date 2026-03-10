@@ -9,11 +9,15 @@ savings (requires fine-tuning).
 
 from __future__ import annotations
 
+import logging
+
 import torch.nn.functional as F
 
 from .base_engine import _BaseCorridorKeyEngine
 from .core.optimized_model import OptimizedGreenFormer
 from .optimization_config import OptimizationConfig
+
+logger = logging.getLogger(__name__)
 
 
 class OptimizedCorridorKeyEngine(_BaseCorridorKeyEngine):
@@ -90,10 +94,11 @@ class OptimizedCorridorKeyEngine(_BaseCorridorKeyEngine):
         other_missing = [k for k in missing if "ltrm" not in k]
 
         if ltrm_missing:
-            print(
-                f"[Optimized] Expected new LTRM keys not in checkpoint ({len(ltrm_missing)} keys) -- using zero-init."
+            logger.info(
+                "[Optimized] Expected new LTRM keys not in checkpoint (%d keys) -- using zero-init.",
+                len(ltrm_missing),
             )
         if other_missing:
-            print(f"[Warning] Missing non-LTRM keys: {other_missing}")
+            logger.warning("[Warning] Missing non-LTRM keys: %s", other_missing)
         if unexpected:
-            print(f"[Warning] Unexpected keys: {unexpected}")
+            logger.warning("[Warning] Unexpected keys: %s", unexpected)

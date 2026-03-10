@@ -21,9 +21,10 @@ import logging
 import threading
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 from .errors import JobCancelledError
 
@@ -108,7 +109,7 @@ class GPUJobQueue:
         in its run loop. The UI submits jobs from the main thread.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._queue: deque[GPUJob] = deque()
         self._lock = threading.Lock()
         self._current_job: GPUJob | None = None

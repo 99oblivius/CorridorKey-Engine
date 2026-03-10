@@ -47,11 +47,13 @@ class BiRefNetProcessor:
         first_param = next(self.model.parameters())
         self.dtype = first_param.dtype
 
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize(IMAGE_SIZE, antialias=True),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Resize(IMAGE_SIZE, antialias=True),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
         logger.info("BiRefNet loaded on %s (dtype=%s).", self.device, self.dtype)
 
     @torch.no_grad()
@@ -80,9 +82,7 @@ class BiRefNetProcessor:
 
         # Resize back to original dimensions
         mask = pred.unsqueeze(0).unsqueeze(0)
-        mask = torch.nn.functional.interpolate(
-            mask, size=(orig_h, orig_w), mode="bilinear", align_corners=False
-        )
+        mask = torch.nn.functional.interpolate(mask, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
         mask = mask.squeeze().clamp(0, 1)
 
         return (mask.numpy() * 255).astype(np.uint8)
@@ -130,10 +130,7 @@ class BiRefNetProcessor:
                 idx += 1
             cap.release()
         else:
-            files = sorted(
-                f for f in input_path.iterdir()
-                if f.is_file() and f.suffix.lower() in IMAGE_EXTS
-            )
+            files = sorted(f for f in input_path.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
             for f in files:
                 if f.suffix.lower() == ".exr":
                     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")

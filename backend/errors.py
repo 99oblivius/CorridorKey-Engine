@@ -4,19 +4,15 @@
 class CorridorKeyError(Exception):
     """Base exception for all CorridorKey backend errors."""
 
-    pass
-
 
 class ClipScanError(CorridorKeyError):
     """Raised when a clip directory cannot be scanned or is malformed."""
-
-    pass
 
 
 class FrameMismatchError(CorridorKeyError):
     """Raised when input and alpha frame counts don't match."""
 
-    def __init__(self, clip_name: str, input_count: int, alpha_count: int):
+    def __init__(self, clip_name: str, input_count: int, alpha_count: int) -> None:
         self.clip_name = clip_name
         self.input_count = input_count
         self.alpha_count = alpha_count
@@ -26,7 +22,7 @@ class FrameMismatchError(CorridorKeyError):
 class FrameReadError(CorridorKeyError):
     """Raised when a frame file cannot be read."""
 
-    def __init__(self, clip_name: str, frame_index: int, path: str):
+    def __init__(self, clip_name: str, frame_index: int, path: str) -> None:
         self.clip_name = clip_name
         self.frame_index = frame_index
         self.path = path
@@ -36,7 +32,7 @@ class FrameReadError(CorridorKeyError):
 class WriteFailureError(CorridorKeyError):
     """Raised when cv2.imwrite or similar write operation fails."""
 
-    def __init__(self, clip_name: str, frame_index: int, path: str):
+    def __init__(self, clip_name: str, frame_index: int, path: str) -> None:
         self.clip_name = clip_name
         self.frame_index = frame_index
         self.path = path
@@ -46,7 +42,7 @@ class WriteFailureError(CorridorKeyError):
 class MaskChannelError(CorridorKeyError):
     """Raised when a mask has unexpected channel count that can't be resolved."""
 
-    def __init__(self, clip_name: str, frame_index: int, channels: int):
+    def __init__(self, clip_name: str, frame_index: int, channels: int) -> None:
         self.clip_name = clip_name
         self.frame_index = frame_index
         self.channels = channels
@@ -56,7 +52,7 @@ class MaskChannelError(CorridorKeyError):
 class VRAMInsufficientError(CorridorKeyError):
     """Raised when there isn't enough GPU VRAM for the requested operation."""
 
-    def __init__(self, required_gb: float, available_gb: float):
+    def __init__(self, required_gb: float, available_gb: float) -> None:
         self.required_gb = required_gb
         self.available_gb = available_gb
         super().__init__(f"Insufficient VRAM: {required_gb:.1f}GB required, {available_gb:.1f}GB available")
@@ -65,7 +61,7 @@ class VRAMInsufficientError(CorridorKeyError):
 class InvalidStateTransitionError(CorridorKeyError):
     """Raised when a clip state transition is not allowed."""
 
-    def __init__(self, clip_name: str, current_state: str, target_state: str):
+    def __init__(self, clip_name: str, current_state: str, target_state: str) -> None:
         self.clip_name = clip_name
         self.current_state = current_state
         self.target_state = target_state
@@ -75,7 +71,7 @@ class InvalidStateTransitionError(CorridorKeyError):
 class JobCancelledError(CorridorKeyError):
     """Raised when a GPU job is cancelled by the user."""
 
-    def __init__(self, clip_name: str, frame_index: int | None = None):
+    def __init__(self, clip_name: str, frame_index: int | None = None) -> None:
         self.clip_name = clip_name
         self.frame_index = frame_index
         msg = f"Clip '{clip_name}': job cancelled"
@@ -87,7 +83,7 @@ class JobCancelledError(CorridorKeyError):
 class FFmpegNotFoundError(CorridorKeyError):
     """Raised when FFmpeg/FFprobe binaries cannot be located."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(
             "FFmpeg not found. Install FFmpeg and ensure it is on PATH, or place it in C:\\Program Files\\ffmpeg\\bin\\"
         )
@@ -96,7 +92,7 @@ class FFmpegNotFoundError(CorridorKeyError):
 class ExtractionError(CorridorKeyError):
     """Raised when video frame extraction fails."""
 
-    def __init__(self, clip_name: str, detail: str):
+    def __init__(self, clip_name: str, detail: str) -> None:
         self.clip_name = clip_name
         self.detail = detail
         super().__init__(f"Clip '{clip_name}': extraction failed — {detail}")

@@ -79,22 +79,28 @@ class TestDiscoverCheckpoint:
             assert result == ckpt
 
     def test_zero_raises(self, tmp_path):
-        with mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)):
-            with pytest.raises(FileNotFoundError, match="No .pth checkpoint"):
-                _discover_checkpoint(TORCH_EXT)
+        with (
+            mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)),
+            pytest.raises(FileNotFoundError, match=r"No \.pth checkpoint"),
+        ):
+            _discover_checkpoint(TORCH_EXT)
 
     def test_zero_with_cross_reference(self, tmp_path):
         (tmp_path / "model.safetensors").touch()
-        with mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)):
-            with pytest.raises(FileNotFoundError, match="--backend=mlx"):
-                _discover_checkpoint(TORCH_EXT)
+        with (
+            mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)),
+            pytest.raises(FileNotFoundError, match="--backend=mlx"),
+        ):
+            _discover_checkpoint(TORCH_EXT)
 
     def test_multiple_raises(self, tmp_path):
         (tmp_path / "a.pth").touch()
         (tmp_path / "b.pth").touch()
-        with mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)):
-            with pytest.raises(ValueError, match="Multiple"):
-                _discover_checkpoint(TORCH_EXT)
+        with (
+            mock.patch("CorridorKeyModule.backend.CHECKPOINT_DIR", str(tmp_path)),
+            pytest.raises(ValueError, match="Multiple"),
+        ):
+            _discover_checkpoint(TORCH_EXT)
 
     def test_safetensors(self, tmp_path):
         ckpt = tmp_path / "model.safetensors"

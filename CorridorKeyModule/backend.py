@@ -174,20 +174,20 @@ def _wrap_mlx_output(raw: dict, despill_strength: float, auto_despeckle: bool, d
 class _MLXEngineAdapter:
     """Wraps CorridorKeyMLXEngine to match Torch output contract."""
 
-    def __init__(self, raw_engine):
+    def __init__(self, raw_engine: object) -> None:
         self._engine = raw_engine
 
     def process_frame(
         self,
-        image,
-        mask_linear,
-        refiner_scale=1.0,
-        input_is_linear=False,
-        fg_is_straight=True,
-        despill_strength=1.0,
-        auto_despeckle=True,
-        despeckle_size=400,
-    ):
+        image: np.ndarray,
+        mask_linear: np.ndarray,
+        refiner_scale: float = 1.0,
+        input_is_linear: bool = False,
+        fg_is_straight: bool = True,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+    ) -> dict:
         """Delegate to MLX engine, then normalize output to Torch contract."""
         # MLX engine expects uint8 input — convert if float
         if image.dtype != np.uint8:
@@ -222,8 +222,8 @@ def create_engine(
     backend: str | None = None,
     device: str | None = None,
     img_size: int = DEFAULT_IMG_SIZE,
-    optimization_config=None,
-):
+    optimization_config: object | None = None,
+) -> object:
     """Factory: returns an engine with process_frame() matching the Torch contract.
 
     Args:
@@ -243,7 +243,7 @@ def create_engine(
         raw_engine = CorridorKeyMLXEngine(str(ckpt), img_size=img_size)
         logger.info("MLX engine loaded: %s", ckpt.name)
         return _MLXEngineAdapter(raw_engine)
-    elif backend == "torch_optimized":
+    if backend == "torch_optimized":
         ckpt = _discover_checkpoint(TORCH_EXT)
         from CorridorKeyModule.optimized_engine import OptimizedCorridorKeyEngine
 
@@ -254,14 +254,13 @@ def create_engine(
             img_size=img_size,
             optimization_config=optimization_config,
         )
-    else:
-        ckpt = _discover_checkpoint(TORCH_EXT)
-        from CorridorKeyModule.inference_engine import CorridorKeyEngine
+    ckpt = _discover_checkpoint(TORCH_EXT)
+    from CorridorKeyModule.inference_engine import CorridorKeyEngine
 
-        logger.info("Torch engine loaded: %s (device=%s)", ckpt.name, device)
-        return CorridorKeyEngine(
-            checkpoint_path=str(ckpt),
-            device=device or "cpu",
-            img_size=img_size,
-            optimization_config=optimization_config,
-        )
+    logger.info("Torch engine loaded: %s (device=%s)", ckpt.name, device)
+    return CorridorKeyEngine(
+        checkpoint_path=str(ckpt),
+        device=device or "cpu",
+        img_size=img_size,
+        optimization_config=optimization_config,
+    )

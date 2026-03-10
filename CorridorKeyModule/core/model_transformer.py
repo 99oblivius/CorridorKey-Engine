@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..optimization_config import OptimizationConfig
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared utility: patch input layer for non-3-channel inputs
@@ -47,7 +51,7 @@ def patch_input_layer(encoder: nn.Module, in_channels: int) -> None:
     except AttributeError:
         encoder.patch_embed.proj = new_conv
 
-    print(f"Patched input layer: 3 channels -> {in_channels} channels (Extra initialized to 0)")
+    logger.info("Patched input layer: 3 channels -> %d channels (Extra initialized to 0)", in_channels)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +96,7 @@ class DecoderHead(nn.Module):
     def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
         c1, c2, c3, c4 = features
 
-        n, _, h, w = c4.shape
+        n, _, _h, _w = c4.shape
 
         # Resize to C1 size (which is H/4)
         _c4 = self.linear_c4(c4.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c4.shape[2], c4.shape[3])
@@ -213,9 +217,9 @@ class GreenFormer(nn.Module):
         self.in_channels = in_channels
 
         # --- Encoder ---
-        print(f"Initializing {encoder_name} (img_size={img_size})...")
+        logger.info("Initializing %s (img_size=%d)...", encoder_name, img_size)
         self.encoder = timm.create_model(encoder_name, pretrained=False, features_only=True, img_size=img_size)
-        print("Skipped downloading base weights (relying on custom checkpoint).")
+        logger.info("Skipped downloading base weights (relying on custom checkpoint).")
 
         # Patch first layer for 4 channels
         if in_channels != 3:
@@ -227,14 +231,14 @@ class GreenFormer(nn.Module):
 
             n_patched = _patch_hiera_global_attention(self.encoder.model)
             if n_patched:
-                print(f"[Optimized] Patched {n_patched} global-attention blocks for FlashAttention.")
+                logger.info("[Optimized] Patched %d global-attention blocks for FlashAttention.", n_patched)
 
         # Get feature info
         try:
             feature_channels = self.encoder.feature_info.channels()
         except (AttributeError, TypeError):
             feature_channels = [112, 224, 448, 896]
-        print(f"Feature Channels: {feature_channels}")
+        logger.info("Feature Channels: %s", feature_channels)
         self._feature_channels = feature_channels
 
         # --- Hiera internals (needed by subclass for token routing) ---
@@ -269,15 +273,16 @@ class GreenFormer(nn.Module):
                     tile_size=self.config.tile_size,
                     tile_overlap=self.config.tile_overlap,
                 )
-                print(
-                    f"[Optimized] Using TiledCNNRefiner "
-                    f"(tile={self.config.tile_size}, overlap={self.config.tile_overlap})."
+                logger.info(
+                    "[Optimized] Using TiledCNNRefiner (tile=%d, overlap=%d).",
+                    self.config.tile_size,
+                    self.config.tile_overlap,
                 )
             else:
                 self.refiner = CNNRefinerModule(in_channels=7, hidden_channels=64, out_channels=4)
         else:
             self.refiner = None
-            print("Refiner Module DISABLED (Backbone Only Mode).")
+            logger.info("Refiner Module DISABLED (Backbone Only Mode).")
 
     # kept for backward compat; delegates to the module-level function
     def _patch_input_layer(self, in_channels: int) -> None:
@@ -311,7 +316,7 @@ class GreenFormer(nn.Module):
         fg_coarse = torch.sigmoid(fg_logits_up)
 
         # Cache clearing before refiner
-        if self.config.cache_clearing and x.is_cuda:
+        if self.config.effective_cache_clearing and x.is_cuda:
             torch.cuda.empty_cache()
 
         # Refine
@@ -347,7 +352,7 @@ class GreenFormer(nn.Module):
         features = self.encoder(x)
 
         # Cache clearing between encoder and decoder
-        if self.config.cache_clearing and x.is_cuda:
+        if self.config.effective_cache_clearing and x.is_cuda:
             torch.cuda.empty_cache()
 
         return self._decode_and_refine(features, x, input_size)

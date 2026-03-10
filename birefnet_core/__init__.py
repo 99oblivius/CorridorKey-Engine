@@ -1,1 +1,1 @@
-from .wrapper import BiRefNetProcessor
+from .wrapper import BiRefNetProcessor as BiRefNetProcessor

@@ -14,6 +14,7 @@ Usage (via launcher scripts):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import logging
 import os
@@ -48,7 +49,16 @@ def _configure_environment() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def interactive_wizard(win_path: str, device: str | None = None, devices: list[str] | None = None, backend: str | None = None, optimization_config=None, img_size: int = 2048, read_workers: int = 0, write_workers: int = 0) -> None:
+def interactive_wizard(
+    win_path: str,
+    device: str | None = None,
+    devices: list[str] | None = None,
+    backend: str | None = None,
+    optimization_config: object | None = None,
+    img_size: int = 2048,
+    read_workers: int = 0,
+    write_workers: int = 0,
+) -> None:
     print("\n" + "=" * 60)
     print(" CORRIDOR KEY - SMART WIZARD")
     print("=" * 60)
@@ -184,10 +194,8 @@ def interactive_wizard(win_path: str, device: str | None = None, devices: list[s
 
         for d in work_dirs:
             entry = ClipEntry(os.path.basename(d), d)
-            try:
+            with contextlib.suppress(FileNotFoundError, ValueError, OSError):
                 entry.find_assets()  # This checks Input and AlphaHint
-            except (FileNotFoundError, ValueError, OSError):
-                pass  # Might act up if Input missing
 
             # Check VideoMamaMaskHint (Strict: videomamamaskhint.ext or VideoMamaMaskHint/)
             has_mask = False
@@ -253,7 +261,7 @@ def interactive_wizard(win_path: str, device: str | None = None, devices: list[s
             input("VideoMaMa batch complete. Press Enter to Re-Scan...")
             continue
 
-        elif choice == "g":
+        if choice == "g":
             # GVM
             print("\n--- GVM Auto-Matte ---")
             print(f"This will generate alphas for {len(raw)} clips that have NO Mask Hint.")
@@ -264,7 +272,7 @@ def interactive_wizard(win_path: str, device: str | None = None, devices: list[s
                 input("GVM batch complete. Press Enter to Re-Scan...")
             continue
 
-        elif choice == "b":
+        if choice == "b":
             # BiRefNet
             print("\n--- BiRefNet Auto-Matte ---")
             print(f"This will generate alphas for {len(raw)} clips using BiRefNet (~4GB VRAM).")
@@ -275,26 +283,34 @@ def interactive_wizard(win_path: str, device: str | None = None, devices: list[s
                 input("BiRefNet batch complete. Press Enter to Re-Scan...")
             continue
 
-        elif choice == "i":
+        if choice == "i":
             # Inference
             print("\n--- Corridor Key Inference ---")
             try:
-                run_inference(ready, device=device, devices=devices, backend=backend, optimization_config=optimization_config, img_size=img_size, read_workers=read_workers, write_workers=write_workers)
+                run_inference(
+                    ready,
+                    device=device,
+                    devices=devices,
+                    backend=backend,
+                    optimization_config=optimization_config,
+                    img_size=img_size,
+                    read_workers=read_workers,
+                    write_workers=write_workers,
+                )
             except (RuntimeError, FileNotFoundError) as e:
                 logger.error(f"Inference failed: {e}")
             input("Inference batch complete. Press Enter to Re-Scan...")
             continue
 
-        elif choice == "r":
+        if choice == "r":
             print("\nRe-scanning...")
             continue
 
-        elif choice == "q":
+        if choice == "q":
             break
 
-        else:
-            print("Invalid selection.")
-            continue
+        print("Invalid selection.")
+        continue
 
     print("\nWizard Complete. Goodbye!")
 
@@ -303,7 +319,11 @@ def main() -> None:
     _configure_environment()
 
     parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
-    parser.add_argument("--action", choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"], required=True)
+    parser.add_argument(
+        "--action",
+        choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"],
+        required=True,
+    )
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
     parser.add_argument(
         "--device",
@@ -328,7 +348,7 @@ def main() -> None:
     # --- Optimization profile & per-optimization flags ---
     parser.add_argument(
         "--profile",
-        choices=["original", "optimized", "experimental"],
+        choices=["original", "optimized", "experimental", "performance"],
         default=None,
         help="Optimization profile (default: inferred from --backend). "
         "Per-optimization flags below override profile settings.",
@@ -343,12 +363,33 @@ def main() -> None:
     parser.add_argument("--no-disable-cudnn-benchmark", dest="disable_cudnn_benchmark", action="store_false")
     parser.add_argument("--token-routing", action="store_true", default=None, help="Enable experimental token routing")
     parser.add_argument("--no-token-routing", dest="token_routing", action="store_false")
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        default=None,
+        help="torch.compile mode (default: from profile). Higher modes increase "
+        "first-run compilation time but produce faster kernels.",
+    )
+    parser.add_argument("--cuda-graphs", action="store_true", default=None, help="Enable manual CUDA graph capture")
+    parser.add_argument("--no-cuda-graphs", dest="cuda_graphs", action="store_false")
+    parser.add_argument(
+        "--tensorrt",
+        action="store_true",
+        default=None,
+        help="Enable TensorRT compilation (requires torch-tensorrt)",
+    )
+    parser.add_argument("--no-tensorrt", dest="tensorrt", action="store_false")
     parser.add_argument("--img-size", type=int, default=2048, help="Model input resolution (default: 2048)")
     parser.add_argument("--tile-size", type=int, default=None, help="Tile size for tiled refiner (default: 512)")
     parser.add_argument("--tile-overlap", type=int, default=None, help="Tile overlap in pixels (default: 128)")
     parser.add_argument("--metrics", action="store_true", default=False, help="Enable per-stage performance metrics")
     parser.add_argument("--read-workers", type=int, default=0, help="Reader thread pool size (0=auto: 2 per GPU)")
-    parser.add_argument("--write-workers", type=int, default=0, help="Total writer threads, split across GPUs (0=auto: all remaining cores)")
+    parser.add_argument(
+        "--write-workers",
+        type=int,
+        default=0,
+        help="Total writer threads, split across GPUs (0=auto: all remaining cores)",
+    )
 
     args = parser.parse_args()
 
@@ -378,12 +419,30 @@ def main() -> None:
             generate_alphas_birefnet(clips, device=device)
         elif args.action == "run_inference":
             clips = scan_clips()
-            run_inference(clips, device=device, backend=backend, optimization_config=optimization_config, devices=devices_list, img_size=args.img_size, read_workers=args.read_workers, write_workers=args.write_workers)
+            run_inference(
+                clips,
+                device=device,
+                backend=backend,
+                optimization_config=optimization_config,
+                devices=devices_list,
+                img_size=args.img_size,
+                read_workers=args.read_workers,
+                write_workers=args.write_workers,
+            )
         elif args.action == "wizard":
             if not args.win_path:
                 print("Error: --win_path required for wizard.")
             else:
-                interactive_wizard(args.win_path, device=device, devices=devices_list, backend=backend, optimization_config=optimization_config, img_size=args.img_size, read_workers=args.read_workers, write_workers=args.write_workers)
+                interactive_wizard(
+                    args.win_path,
+                    device=device,
+                    devices=devices_list,
+                    backend=backend,
+                    optimization_config=optimization_config,
+                    img_size=args.img_size,
+                    read_workers=args.read_workers,
+                    write_workers=args.write_workers,
+                )
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(130)
@@ -392,7 +451,7 @@ def main() -> None:
         sys.exit(1)
 
 
-def _build_optimization_config(args):
+def _build_optimization_config(args: object) -> object | None:
     """Build an OptimizationConfig from CLI args.
 
     Returns None if no profile or optimization flags were specified
@@ -420,6 +479,9 @@ def _build_optimization_config(args):
                     "cache_clearing",
                     "disable_cudnn_benchmark",
                     "token_routing",
+                    "compile_mode",
+                    "cuda_graphs",
+                    "tensorrt",
                     "tile_size",
                     "tile_overlap",
                 )
@@ -442,6 +504,12 @@ def _build_optimization_config(args):
         overrides["disable_cudnn_benchmark"] = args.disable_cudnn_benchmark
     if args.token_routing is not None:
         overrides["token_routing"] = args.token_routing
+    if args.compile_mode is not None:
+        overrides["compile_mode"] = args.compile_mode
+    if args.cuda_graphs is not None:
+        overrides["cuda_graphs"] = args.cuda_graphs
+    if args.tensorrt is not None:
+        overrides["tensorrt"] = args.tensorrt
     if args.tile_size is not None:
         overrides["tile_size"] = args.tile_size
     if args.tile_overlap is not None:

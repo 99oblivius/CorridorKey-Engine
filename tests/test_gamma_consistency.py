@@ -87,7 +87,7 @@ class TestGammaDivergenceMagnitude:
     """
 
     @pytest.mark.parametrize(
-        "linear_val,expected_min_diff",
+        ("linear_val", "expected_min_diff"),
         [
             # In darks, the piecewise linear segment causes the biggest gap.
             # At linear 0.001, piecewise sRGB uses the linear segment (x*12.92)

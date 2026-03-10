@@ -10,6 +10,7 @@ Pure Python, no Qt deps. Provides:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -17,7 +18,12 @@ import re
 import shutil
 import subprocess
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING
+
+from .natural_sort import natsorted
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +116,8 @@ def probe_video(path: str) -> dict:
     # Frame count: prefer nb_frames, fall back to duration * fps
     frame_count = 0
     if "nb_frames" in video_stream:
-        try:
+        with contextlib.suppress(ValueError, TypeError):
             frame_count = int(video_stream["nb_frames"])
-        except (ValueError, TypeError):
-            pass
 
     if frame_count <= 0:
         duration = float(video_stream.get("duration", 0) or data.get("format", {}).get("duration", 0))
@@ -174,7 +178,7 @@ def extract_frames(
     # output buffering) and re-extract from that point.
     _RESUME_ROLLBACK = 3  # frames to re-extract for safety
     start_frame = 0
-    existing = sorted([f for f in os.listdir(out_dir) if f.lower().endswith(".png")])
+    existing = natsorted([f for f in os.listdir(out_dir) if f.lower().endswith(".png")])
     if existing:
         # Remove the last N frames — they may be corrupt or incomplete
         remove_count = min(_RESUME_ROLLBACK, len(existing))
@@ -237,7 +241,7 @@ def extract_frames(
 
     line_q: _queue.Queue[str | None] = _queue.Queue()
 
-    def _reader():
+    def _reader() -> None:
         for ln in proc.stderr:
             line_q.put(ln)
         line_q.put(None)  # sentinel
@@ -250,10 +254,8 @@ def extract_frames(
             # Check cancellation every 0.2s even if no output
             if cancel_event and cancel_event.is_set():
                 proc.kill()
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
                 logger.info("Extraction cancelled — FFmpeg killed")
                 return last_frame
 
@@ -398,7 +400,7 @@ def read_video_metadata(clip_root: str) -> dict | None:
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.debug(f"Failed to read video metadata: {e}")

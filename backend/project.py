@@ -1,4 +1,4 @@
-"""Project folder management — creation, scanning, and metadata.
+"""Project folder management -- creation, scanning, and metadata.
 
 A project is a timestamped container holding one or more clips:
     Projects/
@@ -27,6 +27,12 @@ import re
 import shutil
 import sys
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+from .natural_sort import natsorted
+
+if TYPE_CHECKING:
+    from .clip_state import InOutRange
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +258,7 @@ def get_clip_dirs(project_dir: str) -> list[str]:
     """
     clips_dir = os.path.join(project_dir, "clips")
     if os.path.isdir(clips_dir):
-        return sorted(
+        return natsorted(
             os.path.join(clips_dir, d)
             for d in os.listdir(clips_dir)
             if os.path.isdir(os.path.join(clips_dir, d)) and not d.startswith(".") and not d.startswith("_")
@@ -341,7 +347,7 @@ def set_display_name(root: str, name: str) -> None:
         write_project_json(root, data)
 
 
-def save_in_out_range(clip_root: str, in_out) -> None:
+def save_in_out_range(clip_root: str, in_out: InOutRange | None) -> None:
     """Persist in/out range to clip.json (v2) or project.json (v1).
 
     Pass None to clear.
@@ -362,7 +368,7 @@ def save_in_out_range(clip_root: str, in_out) -> None:
         write_project_json(clip_root, data)
 
 
-def load_in_out_range(clip_root: str):
+def load_in_out_range(clip_root: str) -> InOutRange | None:
     """Load in/out range from clip.json or project.json, or None if not set."""
     data = _read_clip_or_project_json(clip_root)
     if data and "in_out_range" in data:

@@ -22,6 +22,7 @@ The model loads the same .pth checkpoint as the original GreenFormer.
 
 from __future__ import annotations
 
+import logging
 import math
 import types
 
@@ -31,6 +32,8 @@ import torch.nn.functional as F
 
 from ..optimization_config import OptimizationConfig
 from .model_transformer import CNNRefinerModule, GreenFormer
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Fix: Patch Hiera's global attention to use FlashAttention-compatible shapes
@@ -45,7 +48,7 @@ def _patch_hiera_global_attention(hiera: nn.Module) -> int:
     (global attention in Stages 2-3), this 5-D non-contiguous tensor is
     passed to ``F.scaled_dot_product_attention``.  PyTorch's FlashAttention
     kernel requires 4-D contiguous input and silently falls back to the
-    **math** backend, which materialises the full N×N attention matrix --
+    **math** backend, which materialises the full NxN attention matrix --
     causing OOM on 8 GB GPUs.
 
     The fix: for global-attention blocks (``use_mask_unit_attn == False``),
@@ -62,8 +65,8 @@ def _patch_hiera_global_attention(hiera: nn.Module) -> int:
             continue  # windowed attention -- already efficient
 
         # Replace forward with a version that squeezes num_windows
-        def _make_patched_forward(original_attn):
-            def _patched_forward(self, x: torch.Tensor) -> torch.Tensor:
+        def _make_patched_forward(original_attn: nn.Module) -> types.MethodType:
+            def _patched_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
                 B, N, _ = x.shape
                 # num_windows == 1 for global attention
                 qkv = self.qkv(x)
@@ -168,7 +171,7 @@ class LTRM(nn.Module):
                            When token count doesn't match H*W (because we only
                            have a subset), we pad and then unpad.
         """
-        B, N, C = x.shape
+        B, N, _C = x.shape
         H_tok, W_tok = spatial_shape
 
         residual = x
@@ -180,7 +183,7 @@ class LTRM(nn.Module):
         # Reshape to 2D for depthwise conv.
         # Since we may have a ragged subset of tokens, we use zero-padded full grid
         # and mask out the results.  When N == H_tok * W_tok we skip padding.
-        if N == H_tok * W_tok:
+        if H_tok * W_tok == N:
             x_2d = x.transpose(1, 2).view(B, hidden, H_tok, W_tok)
             x_2d = self.act2(self.dw_conv(x_2d))
             x = x_2d.flatten(2).transpose(1, 2)  # [B, N, hidden]
@@ -335,7 +338,7 @@ class TiledCNNRefiner(CNNRefinerModule):
         full_input = torch.cat([img, coarse_pred], dim=1)  # [B, 7, H, W]
 
         # If image fits in a single tile, skip tiling overhead
-        if H <= self.tile_size and W <= self.tile_size:
+        if self.tile_size >= H and self.tile_size >= W:
             return self._process_tile(full_input)
 
         stride = self.tile_size - self.tile_overlap
@@ -438,12 +441,12 @@ class OptimizedGreenFormer(GreenFormer):
                 threshold_high=self.config.edge_threshold_high,
                 min_edge_tokens=self.config.min_edge_tokens,
             )
-            print("[Optimized] Token routing ENABLED (experimental, needs fine-tuning).")
+            logger.info("[Optimized] Token routing ENABLED (experimental, needs fine-tuning).")
         else:
             self.ltrm_stage2 = None
             self.ltrm_stage3 = None
             self.router = None
-            print("[Optimized] Token routing DISABLED (using SDPA for efficient attention).")
+            logger.info("[Optimized] Token routing DISABLED (using SDPA for efficient attention).")
 
     # ------------------------------------------------------------------
     # Token routing helpers (only used when config.token_routing=True)
@@ -462,7 +465,7 @@ class OptimizedGreenFormer(GreenFormer):
         Edge tokens pass through the original block (global attention + MLP).
         Easy tokens pass through LTRM.
         """
-        B_eff, N, C = x.shape
+        B_eff, N, _C = x.shape
         B = edge_mask.shape[0]
         N_spatial = edge_mask.shape[1]
 
@@ -473,7 +476,10 @@ class OptimizedGreenFormer(GreenFormer):
             return ltrm(x, spatial_shape)
 
         # For global attention stages, B_eff == B and N == N_spatial
-        assert B_eff == B and N == N_spatial, (
+        assert B_eff == B, (
+            f"Token routing expects global attention stage: B_eff={B_eff}, B={B}, N={N}, N_spatial={N_spatial}"
+        )
+        assert N_spatial == N, (
             f"Token routing expects global attention stage: B_eff={B_eff}, B={B}, N={N}, N_spatial={N_spatial}"
         )
 
@@ -586,7 +592,7 @@ class OptimizedGreenFormer(GreenFormer):
         features = self._forward_encoder_with_routing(x, alpha_hint)
 
         # Cache clearing between encoder and decoder
-        if self.config.cache_clearing and x.is_cuda:
+        if self.config.effective_cache_clearing and x.is_cuda:
             torch.cuda.empty_cache()
 
         return self._decode_and_refine(features, x, input_size)
