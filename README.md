@@ -16,18 +16,18 @@ Fork of [nikopueringer/CorridorKey](https://github.com/nikopueringer/CorridorKey
 
 ## Hardware
 
-**This software saturates your GPU at 100% utilization. Ensure adequate cooling.**
+**This software saturates your CPU & GPU at 100% utilization. Ensure adequate cooling.**
 
 | Component | VRAM |
 |---|---|
-| CorridorKey (optimized profile) | ~8 GB |
+| CorridorKey (optimized profile) | <8 GB |
 | CorridorKey (original, unoptimized) | ~22.7 GB |
 | + GPU postprocessing | +~1.5 GB |
 | + cuDNN auto-tune (`--cudnn-benchmark`) | +2-5 GB |
 | BiRefNet alpha hints | ~4 GB |
 | GVM / VideoMaMa alpha hints | ~80 GB |
 
-24 GB GPU recommended (RTX 3090/4090/5090). The optimized profile fits in 8-12 GB.
+12 GB GPU recommended. The 2048 profile compilation and 4K inference fits in 8-12 GB. 1024 img_size fits in 2-3 GB.
 Running on a GPU that is not driving your display avoids OOM from compositor overhead.
 
 **Windows:** NVIDIA drivers must support CUDA 12.6+.
@@ -53,10 +53,10 @@ uv sync
 # CorridorKey (required, ~300 MB)
 uv run hf download nikopueringer/CorridorKey_v1.0 --local-dir CorridorKeyModule/checkpoints
 
+# BiRefNet -- downloaded automatically via torchhub
+
 # GVM (optional)
 uv run hf download geyongtao/gvm --local-dir gvm_core/weights
-
-# BiRefNet -- downloaded automatically via torchhub
 
 # VideoMaMa (optional)
 uv run hf download SammyLim/VideoMaMa --local-dir VideoMaMaInferenceModule/checkpoints/VideoMaMa
@@ -72,6 +72,18 @@ uv run hf download stabilityai/stable-video-diffusion-img2vid-xt \
 ```bash
 uv run corridorkey wizard "/path/to/footage"
 # Windows: drag folder onto CorridorKey_DRAG_CLIPS_HERE_local.bat
+```
+
+### Example
+
+Recommendations:
+- 1024 for FullHD
+- 2048 for 4K footage
+- --cpu-postprocess mostly only makes sense for under FullHD resolutions with a slower GPU
+- --dma-buffers defaults to 2 but for a small cost in additional video memory can perform faster if the GPU is not bottlenecked
+
+```bash
+uv run corridorkey wizard "/path/to/footage" --img-size 1024 --cudnn-benchmark --gpu-postprocess --dma-buffers 3 --no-comp-png --precision fp16
 ```
 
 ### Subcommands
@@ -123,11 +135,11 @@ Each GPU loads its own model copy. VRAM per GPU is unchanged; throughput scales 
 
 | Flag | Effect |
 |---|---|
-| `--gpu-postprocess` / `--cpu-postprocess` | GPU: faster, +~1.5 GB. CPU: saves VRAM, runs parallel with next inference frame |
+| `--gpu-postprocess` / `--cpu-postprocess` | GPU: faster, +~1.5 GB VRAM |
 | `--cudnn-benchmark` | cuDNN kernel auto-tune. +2-5 GB VRAM, faster convolutions after warmup |
 | `--no-comp-png` | Skip composite PNG output (saves write IO) |
 | `--checkerboard` | Opaque checkerboard comp instead of transparent RGBA |
-| `--compile-mode MODE` | `default`, `reduce-overhead`, `max-autotune`. Longer first-frame warmup |
+| `--compile-mode MODE` | `default`, `reduce-overhead`, `max-autotune`. (WIP) Longer first-frame warmup |
 | `--dma-buffers N` | Pinned DMA buffers for GPU->CPU transfer (2-3). ~87 MB page-locked RAM each at 1080p |
 | `--token-routing` | Experimental sparse attention. Can improve speed at 4K+ |
 | `--precision PREC` | `fp16` (default), `bf16`, `fp32` |
