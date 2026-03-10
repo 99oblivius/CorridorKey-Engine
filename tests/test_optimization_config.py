@@ -1,18 +1,12 @@
-"""Tests for OptimizationConfig and PerformanceMetrics."""
+"""Tests for OptimizationConfig."""
 
 from __future__ import annotations
 
 import dataclasses
-import time
 
 import pytest
-import torch
 
-from CorridorKeyModule.optimization_config import (
-    OptimizationConfig,
-    PerformanceMetrics,
-    StageMetric,
-)
+from CorridorKeyModule.optimization_config import OptimizationConfig
 
 # ---------------------------------------------------------------------------
 # OptimizationConfig
@@ -30,7 +24,6 @@ class TestOptimizationConfigProfiles:
         assert cfg.disable_cudnn_benchmark is False
         assert cfg.cache_clearing is False
         assert cfg.token_routing is False
-        assert cfg.enable_metrics is False
 
     def test_optimized_profile(self):
         cfg = OptimizationConfig.optimized()
@@ -72,7 +65,7 @@ class TestOptimizationConfigImmutability:
         assert tweaked.cache_clearing is False  # unchanged
 
     def test_replace_preserves_type(self):
-        cfg = dataclasses.replace(OptimizationConfig.optimized(), enable_metrics=True)
+        cfg = dataclasses.replace(OptimizationConfig.optimized(), flash_attention=False)
         assert isinstance(cfg, OptimizationConfig)
 
 
@@ -120,64 +113,3 @@ class TestOptimizationConfigHelpers:
         assert "flash_attention" in summary
         assert "tiled_refiner" in summary
 
-
-# ---------------------------------------------------------------------------
-# PerformanceMetrics
-# ---------------------------------------------------------------------------
-
-
-class TestPerformanceMetrics:
-    def test_measure_records_timing(self):
-        metrics = PerformanceMetrics()
-        with metrics.measure("test_stage", torch.device("cpu")):
-            time.sleep(0.01)
-        assert len(metrics.stages) == 1
-        assert metrics.stages[0].name == "test_stage"
-        assert metrics.stages[0].duration_ms >= 5  # allow some slack
-
-    def test_measure_multiple_stages(self):
-        metrics = PerformanceMetrics()
-        with metrics.measure("stage_a", torch.device("cpu")):
-            pass
-        with metrics.measure("stage_b", torch.device("cpu")):
-            pass
-        assert len(metrics.stages) == 2
-        assert metrics.stages[0].name == "stage_a"
-        assert metrics.stages[1].name == "stage_b"
-
-    def test_finalize_sums_durations(self):
-        metrics = PerformanceMetrics()
-        with metrics.measure("a", torch.device("cpu")):
-            time.sleep(0.01)
-        with metrics.measure("b", torch.device("cpu")):
-            time.sleep(0.01)
-        metrics.finalize(torch.device("cpu"))
-        assert metrics.total_duration_ms >= 10
-
-    def test_summary_format(self):
-        metrics = PerformanceMetrics()
-        with metrics.measure("encode", torch.device("cpu")):
-            pass
-        metrics.finalize(torch.device("cpu"))
-        summary = metrics.summary()
-        assert "encode" in summary
-        assert "TOTAL" in summary
-        assert "ms" in summary
-
-    def test_cpu_no_vram(self):
-        metrics = PerformanceMetrics()
-        with metrics.measure("cpu_stage", torch.device("cpu")):
-            pass
-        assert metrics.stages[0].vram_before_mb == 0.0
-        assert metrics.stages[0].vram_after_mb == 0.0
-        assert metrics.stages[0].vram_peak_mb == 0.0
-
-
-class TestStageMetric:
-    def test_defaults(self):
-        m = StageMetric(name="test")
-        assert m.name == "test"
-        assert m.duration_ms == 0.0
-        assert m.vram_before_mb == 0.0
-        assert m.vram_after_mb == 0.0
-        assert m.vram_peak_mb == 0.0

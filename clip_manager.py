@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import glob
 import logging
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 # Enable OpenEXR support in OpenCV — needed for EXR I/O throughout the pipeline.
@@ -19,10 +19,26 @@ from backend.natural_sort import natsorted
 from device_utils import resolve_device
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from birefnet_core import BiRefNetProcessor
     from gvm_core import GVMProcessor
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class InferenceSettings:
+    """Settings for CorridorKey inference, extracted from interactive prompts.
+
+    Can be constructed directly for non-interactive use (Nuke, Houdini, batch scripts).
+    """
+
+    input_is_linear: bool = False
+    despill_strength: float = 0.5  # 0.0-1.0
+    auto_despeckle: bool = True
+    despeckle_size: int = 400
+    refiner_scale: float = 1.0
 
 
 # Core Paths
@@ -30,8 +46,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLIPS_DIR = os.path.join(BASE_DIR, "ClipsForInference")
 OUTPUT_DIR = os.path.join(BASE_DIR, "Output")
 
-# Network Mapping
-# Windows Drive -> Linux Mount Point
 WIN_DRIVE_ROOT = "V:\\"
 LINUX_MOUNT_ROOT = "/mnt/ssd-storage"
 
@@ -186,7 +200,12 @@ def get_gvm_processor(device: str = "cpu") -> GVMProcessor:
         raise RuntimeError(f"Failed to initialize GVM Processor: {e}") from e
 
 
-def generate_alphas(clips: list[ClipEntry], device: str | None = None) -> None:
+def generate_alphas(
+    clips: list[ClipEntry],
+    device: str | None = None,
+    *,
+    on_clip_start: Callable[[str, int], None] | None = None,
+) -> None:
     clips_to_process = [c for c in clips if c.alpha_asset is None]
 
     if not clips_to_process:
@@ -210,6 +229,8 @@ def generate_alphas(clips: list[ClipEntry], device: str | None = None) -> None:
 
     for clip in clips_to_process:
         logger.info(f"Generating Alpha for: {clip.name}")
+        if on_clip_start:
+            on_clip_start(clip.name, len(clips_to_process))
 
         alpha_output_dir = os.path.join(clip.root_path, "AlphaHint")
         if os.path.exists(alpha_output_dir):
@@ -278,7 +299,12 @@ def get_birefnet_processor(device: str = "cpu") -> BiRefNetProcessor:
         raise RuntimeError(f"Failed to initialize BiRefNet Processor: {e}") from e
 
 
-def generate_alphas_birefnet(clips: list[ClipEntry], device: str | None = None) -> None:
+def generate_alphas_birefnet(
+    clips: list[ClipEntry],
+    device: str | None = None,
+    *,
+    on_clip_start: Callable[[str, int], None] | None = None,
+) -> None:
     """Generate coarse alpha hints using BiRefNet salient object segmentation.
 
     This is a lightweight alternative to GVM that runs on consumer GPUs (~4 GB VRAM).
@@ -308,6 +334,8 @@ def generate_alphas_birefnet(clips: list[ClipEntry], device: str | None = None) 
 
     for clip in clips_to_process:
         logger.info(f"Generating Alpha (BiRefNet) for: {clip.name}")
+        if on_clip_start:
+            on_clip_start(clip.name, len(clips_to_process))
 
         alpha_output_dir = os.path.join(clip.root_path, "AlphaHint")
         if os.path.exists(alpha_output_dir):
@@ -327,7 +355,14 @@ def generate_alphas_birefnet(clips: list[ClipEntry], device: str | None = None) 
             traceback.print_exc()
 
 
-def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | None = None) -> None:
+def run_videomama(
+    clips: list[ClipEntry],
+    chunk_size: int = 50,
+    device: str | None = None,
+    *,
+    on_clip_start: Callable[[str, int], None] | None = None,
+    on_frame_complete: Callable[[int, int], None] | None = None,
+) -> None:
     """
     Runs VideoMaMa on clips that have VideoMamaMaskHint but NO AlphaHint.
     """
@@ -400,6 +435,8 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
 
     for clip in clips_to_process:
         logger.info(f"Running VideoMaMa on: {clip.name}")
+        if on_clip_start:
+            on_clip_start(clip.name, len(clips_to_process))
 
         # Retrieve resolved path
         mask_hint_path = clip_mask_paths[clip.name]
@@ -412,12 +449,14 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
         input_frames = []
         if clip.input_asset.type == "video":
             cap = cv2.VideoCapture(clip.input_asset.path)
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                input_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            cap.release()
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    input_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            finally:
+                cap.release()
         else:
             files = natsorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
             for f in files:
@@ -474,16 +513,18 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
         elif os.path.isfile(mask_hint_path):
             # Handle Video File
             cap = cv2.VideoCapture(mask_hint_path)
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                # Convert to Grayscale
-                m = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Force Binary Thresholding
-                _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
-                mask_frames.append(m)
-            cap.release()
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Convert to Grayscale
+                    m = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    # Force Binary Thresholding
+                    _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
+                    mask_frames.append(m)
+            finally:
+                cap.release()
 
         # Validate Lengths
         num_frames = min(len(input_frames), len(mask_frames))
@@ -542,6 +583,8 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
                     # Convert to BGR and Save
                     cv2.imwrite(out_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                     total_saved += 1
+                    if on_frame_complete:
+                        on_frame_complete(total_saved, num_frames)
 
                 logger.info(f"  Saved {total_saved}/{num_frames} frames...")
 
@@ -594,11 +637,15 @@ def run_inference(
     device: str | None = None,
     backend: str | None = None,
     max_frames: int | None = None,
+    settings: InferenceSettings | None = None,
     optimization_config: object | None = None,
     devices: list[str] | None = None,
     img_size: int = 2048,
     read_workers: int = 0,
     write_workers: int = 0,
+    *,
+    on_clip_start: Callable[[str, int], None] | None = None,
+    on_frame_complete: Callable[[int, int, int, int], None] | None = None,
 ) -> None:
     ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
 
@@ -608,64 +655,25 @@ def run_inference(
 
     logger.info(f"Found {len(ready_clips)} clips ready for inference.")
 
-    # --- User Prompts ---
-    logger.info("\n--- Inference Settings ---")
+    if settings is None:
+        settings = InferenceSettings()
 
-    # 1. Gamma Prompt
-    user_input_is_linear = False
-    gamma_choice = input("Is the input sequence Linear (l) or sRGB (s)? [l/s]: ").strip().lower()
-    if gamma_choice == "l":
-        user_input_is_linear = True
-        logger.info("User selected: Linear Input")
-    else:
-        logger.info("User selected: sRGB Input (or default)")
-
-    # 2. Despill Prompt
-    despill_val = input("Enter Despill Strength (0-10, 10 is max despill) [default 5]: ").strip()
-    try:
-        despill_int = int(despill_val)
-        despill_int = max(0, min(10, despill_int))
-    except ValueError:
-        despill_int = 5
-
-    despill_strength = despill_int / 10.0
-    logger.info(f"User selected: Despill Strength {despill_int}/10 ({despill_strength})")
-    # 3. Auto-Despeckle Prompt
-    auto_despeckle = True
-    despeckle_size = 400
-    despeckle_choice = input("Enable Auto-Despeckle (removes tracking dots in Processed/Comp)? [Y/n]: ").strip().lower()
-    if despeckle_choice == "n":
-        auto_despeckle = False
-        logger.info("User selected: Auto-Despeckle OFF")
-    else:
-        logger.info("User selected: Auto-Despeckle ON (default)")
-        size_val = input("Enter Auto-Despeckle Size (min pixels for a spot) [default 400]: ").strip()
-        try:
-            val_int = int(size_val)
-            despeckle_size = max(0, val_int)
-        except ValueError:
-            despeckle_size = 400
-        logger.info(f"User selected: Auto-Despeckle Size {despeckle_size}px")
-
-    # 4. Refiner Strength Prompt
-    refiner_val = input("Enter Refiner Strength (multiplier) [default 1.0] (experimental): ").strip()
-    if refiner_val == "":
-        refiner_scale = 1.0
-    else:
-        try:
-            refiner_scale = float(refiner_val)
-        except ValueError:
-            refiner_scale = 1.0
-    logger.info(f"User selected: Refiner Strength {refiner_scale}")
-
-    logger.info("--------------------------\n")
+    logger.info(
+        "Inference settings: linear=%s, despill=%.1f, despeckle=%s (size=%d), refiner=%.1f",
+        settings.input_is_linear,
+        settings.despill_strength,
+        settings.auto_despeckle,
+        settings.despeckle_size,
+        settings.refiner_scale,
+    )
 
     # Ensure Output Directory exists
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- Initialize Async Pipeline ---
-    from backend.async_pipeline import AsyncInferencePipeline, InferenceSettings, PipelineConfig
+    from backend.async_pipeline import AsyncInferencePipeline, PipelineConfig
+    from backend.async_pipeline import InferenceSettings as PipelineSettings
 
     config = PipelineConfig(
         img_size=img_size,
@@ -674,16 +682,17 @@ def run_inference(
         optimization_config=optimization_config,
         read_workers=read_workers,
         write_workers=write_workers,
+        output_comp_png=getattr(optimization_config, 'output_comp_png', True) if optimization_config else True,
     )
     pipeline = AsyncInferencePipeline(config)
     pipeline.load_engines()
 
-    settings = InferenceSettings(
-        input_is_linear=user_input_is_linear,
-        despill_strength=despill_strength,
-        auto_despeckle=auto_despeckle,
-        despeckle_size=despeckle_size,
-        refiner_scale=refiner_scale,
+    pipeline_settings = PipelineSettings(
+        input_is_linear=settings.input_is_linear,
+        despill_strength=settings.despill_strength,
+        auto_despeckle=settings.auto_despeckle,
+        despeckle_size=settings.despeckle_size,
+        refiner_scale=settings.refiner_scale,
     )
 
     import tempfile
@@ -712,6 +721,9 @@ def run_inference(
         if num_frames == 0:
             logger.warning(f"Clip '{clip.name}': 0 frames to process, skipping.")
             continue
+
+        if on_clip_start:
+            on_clip_start(clip.name, num_frames)
 
         # --- Build explicit frame path lists ---
         # Video inputs must be pre-extracted for parallel reading
@@ -744,8 +756,9 @@ def run_inference(
                 alpha_paths=alpha_paths,
                 input_stems=input_stems,
                 output_dirs={"fg": fg_dir, "matte": matte_dir, "comp": comp_dir, "processed": proc_dir},
-                settings=settings,
+                settings=pipeline_settings,
                 max_frames=max_frames,
+                on_progress=on_frame_complete,
             )
 
             logger.info(
@@ -891,73 +904,15 @@ def scan_clips() -> list[ClipEntry]:
             invalid_clips.append((d, f"Unexpected error: {e}"))
 
     if invalid_clips:
-        logger.warning("\n" + "=" * 60)
+        logger.warning("=" * 60)
         logger.warning(" INVALID OR SKIPPED CLIPS")
         logger.warning("=" * 60)
         for name, reason in invalid_clips:
             logger.warning("- %s: %s", name, reason)
-        logger.warning("=" * 60 + "\n")
+        logger.warning("=" * 60)
     else:
-        logger.info("\nAll clip folders appear valid.\n")
+        logger.info("All clip folders appear valid.")
 
     return valid_clips
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
-    parser.add_argument(
-        "--action",
-        choices=["generate_alphas", "generate_alphas_birefnet", "run_inference", "list", "wizard"],
-        required=True,
-    )
-    parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
-    parser.add_argument(
-        "--device",
-        choices=["auto", "cuda", "mps", "cpu"],
-        default="auto",
-        help="Compute device (default: auto-detect CUDA > MPS > CPU)",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "torch", "mlx"],
-        default="auto",
-        help="Inference backend (default: auto-detect MLX on Apple Silicon, else Torch)",
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Limit number of frames to process per clip (e.g. 1 for first frame only)",
-    )
-    parser.add_argument(
-        "--devices",
-        default=None,
-        help="Comma-separated GPU indices to use for inference (e.g. 0,1). Bypasses VRAM auto-detection.",
-    )
-
-    args = parser.parse_args()
-
-    device = resolve_device(args.device)
-    logger.info(f"Using device: {device}")
-
-    # Parse --devices into list of cuda:N strings
-    devices_list = None
-    if args.devices:
-        devices_list = [f"cuda:{idx.strip()}" for idx in args.devices.split(",")]
-
-    if args.action == "list":
-        scan_clips()
-    elif args.action == "generate_alphas":
-        clips = scan_clips()
-        generate_alphas(clips, device=device)
-    elif args.action == "generate_alphas_birefnet":
-        clips = scan_clips()
-        generate_alphas_birefnet(clips, device=device)
-    elif args.action == "run_inference":
-        clips = scan_clips()
-        run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames, devices=devices_list)
-    elif args.action == "wizard":
-        if not args.win_path:
-            logger.error("Error: --win_path required for wizard.")
-        else:
-            raise NotImplementedError("interactive_wizard is not yet implemented")

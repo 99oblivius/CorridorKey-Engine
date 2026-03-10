@@ -1,19 +1,12 @@
-"""Optimization configuration and performance metrics for CorridorKey inference.
+"""Optimization configuration for CorridorKey inference.
 
 Provides an ``OptimizationConfig`` frozen dataclass that toggles each VRAM
-optimization independently, and a ``PerformanceMetrics`` helper that can
-measure per-stage timing and VRAM usage.
+optimization independently.
 """
 
 from __future__ import annotations
 
-import time
-from contextlib import contextmanager
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -93,6 +86,24 @@ class OptimizationConfig:
     failure.  Incompatible with ``cuda_graphs`` (TensorRT manages its
     own graph capture internally)."""
 
+    gpu_postprocess: bool = True
+    """When True, postprocessing (resize, despill, sRGB conversion, compositing)
+    runs on GPU. When False, uses CPU. GPU is faster at 4K+ but uses ~1.5 GB
+    more VRAM. CPU path runs parallel with next frame's inference."""
+
+    output_comp_png: bool = True
+    """Write a composite PNG preview for each frame."""
+
+    comp_checkerboard: bool = False
+    """Use checkerboard background for the composite (opaque RGB). When False,
+    the composite is transparent RGBA (cheaper — skips checkerboard generation
+    and extra sRGB conversions)."""
+
+    dma_buffers: int = 2
+    """Number of pinned-memory DMA buffers for GPU->CPU transfer (2-3).
+    Higher values reduce stalls when drain workers are slow, but each buffer
+    uses ~87 MB of page-locked RAM at FullHD."""
+
     # --- Tiling parameters ---
 
     tile_size: int = 512
@@ -113,12 +124,6 @@ class OptimizationConfig:
     min_edge_tokens: int = 64
     """Minimum number of edge tokens; if fewer are found, all tokens fall
     back to full global attention."""
-
-    # --- Performance metrics ---
-
-    enable_metrics: bool = False
-    """When ``True``, collect per-stage timing and VRAM usage metrics.
-    Results are returned in the ``"metrics"`` key of the output dict."""
 
     # ------------------------------------------------------------------
     # Derived helpers
@@ -177,6 +182,7 @@ class OptimizationConfig:
             model_precision="float16",
             high_matmul_precision=True,
             token_routing=False,
+            dma_buffers=2,
         )
 
     @classmethod
@@ -209,6 +215,7 @@ class OptimizationConfig:
             high_matmul_precision=True,
             token_routing=False,
             compile_mode="max-autotune",
+            dma_buffers=3,
         )
 
     @classmethod
@@ -257,6 +264,14 @@ class OptimizationConfig:
             names.append("cuda_graphs")
         if self.tensorrt:
             names.append("tensorrt")
+        if not self.gpu_postprocess:
+            names.append("cpu_postprocess")
+        if not self.output_comp_png:
+            names.append("no_comp_png")
+        if self.comp_checkerboard:
+            names.append("comp_checkerboard")
+        if self.dma_buffers != 2:
+            names.append(f"dma_buffers={self.dma_buffers}")
         return names
 
     def summary(self) -> str:
@@ -265,81 +280,3 @@ class OptimizationConfig:
         if not active:
             return "OptimizationConfig: original (no optimizations)"
         return f"OptimizationConfig: {', '.join(active)}"
-
-
-# ---------------------------------------------------------------------------
-# Performance Metrics
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class StageMetric:
-    """Timing and VRAM data for a single inference stage."""
-
-    name: str
-    duration_ms: float = 0.0
-    vram_before_mb: float = 0.0
-    vram_after_mb: float = 0.0
-    vram_peak_mb: float = 0.0
-
-
-@dataclass
-class PerformanceMetrics:
-    """Collected per-frame performance data.
-
-    Use the :meth:`measure` context manager to instrument individual stages.
-    """
-
-    stages: list[StageMetric] = field(default_factory=list)
-    total_duration_ms: float = 0.0
-    peak_vram_mb: float = 0.0
-
-    @contextmanager
-    def measure(self, stage_name: str, device: torch.device) -> Generator[StageMetric, None, None]:
-        """Context manager that records timing and VRAM for *stage_name*.
-
-        Example::
-
-            with metrics.measure("encoder", self.device):
-                features = self.model.encoder(x)
-        """
-        metric = StageMetric(name=stage_name)
-
-        is_cuda = device.type == "cuda"
-        if is_cuda:
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            metric.vram_before_mb = torch.cuda.memory_allocated(device) / (1024**2)
-
-        t0 = time.perf_counter()
-        yield metric
-        elapsed = time.perf_counter() - t0
-
-        metric.duration_ms = elapsed * 1000.0
-
-        if is_cuda:
-            torch.cuda.synchronize(device)
-            metric.vram_after_mb = torch.cuda.memory_allocated(device) / (1024**2)
-            metric.vram_peak_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
-
-        self.stages.append(metric)
-
-    def finalize(self, device: torch.device) -> None:
-        """Compute totals after all stages have been measured."""
-        self.total_duration_ms = sum(s.duration_ms for s in self.stages)
-        if device.type == "cuda":
-            self.peak_vram_mb = max((s.vram_peak_mb for s in self.stages), default=0.0)
-
-    def summary(self) -> str:
-        """Return a human-readable summary string."""
-        lines = ["Performance Metrics:"]
-        for s in self.stages:
-            line = f"  {s.name}: {s.duration_ms:.1f} ms"
-            if s.vram_peak_mb > 0:
-                line += f"  |  VRAM: {s.vram_before_mb:.0f} -> {s.vram_after_mb:.0f} MB (peak {s.vram_peak_mb:.0f} MB)"
-            lines.append(line)
-        total_line = f"  TOTAL: {self.total_duration_ms:.1f} ms"
-        if self.peak_vram_mb > 0:
-            total_line += f"  |  Peak VRAM: {self.peak_vram_mb:.0f} MB"
-        lines.append(total_line)
-        return "\n".join(lines)

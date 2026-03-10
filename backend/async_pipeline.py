@@ -24,7 +24,10 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import cv2
 import numpy as np
@@ -40,9 +43,8 @@ class _TimelineProfiler:
     """Thread-safe timeline profiler that records span events across all workers.
 
     Each event is a (timestamp, thread/device, stage, start/end, frame_index)
-    tuple.  At the end of a run, produces:
-      - A CSV file with one row per event for offline analysis
-      - Console summary with p50 fps, phase durations, per-GPU stats
+    tuple.  At the end of a run, produces a console summary with p50 fps,
+    phase durations, and per-GPU stats.
     """
 
     def __init__(self, t0: float) -> None:
@@ -76,18 +78,6 @@ class _TimelineProfiler:
         with self._lock:
             self._frame_done_times.append(time.perf_counter())
 
-    def write_csv(self, path: str) -> None:
-        """Write all events to a CSV file for offline analysis."""
-        import csv
-
-        with self._lock:
-            events = sorted(self._events, key=lambda e: e[0])
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["time_s", "worker", "stage", "type", "frame_idx"])
-            for row in events:
-                w.writerow(row)
-
     def console_summary(
         self,
         num_frames: int,
@@ -96,6 +86,7 @@ class _TimelineProfiler:
         read_wall: float,
         infer_wall: float,
         write_drain: float,
+        completed_at_infer_done: int = 0,
     ) -> str:
         """Produce concise console summary."""
         with self._lock:
@@ -122,6 +113,10 @@ class _TimelineProfiler:
             f"  Total            : {total_wall:7.2f}s",
             f"  Frames           : {num_frames}",
             f"  Throughput       : {num_frames / total_wall:.2f} fps (overall)  |  {fps_str} fps (p50 sustained)",
+            (
+                f"  GPU vs CPU       : GPU done at {completed_at_infer_done}/{num_frames}"
+                f" written ({completed_at_infer_done * 100 // num_frames}%)"
+            ),
         ]
 
         # Per-GPU stats from events
@@ -175,6 +170,7 @@ class PipelineConfig:
     devices: list[str] | None = None  # None = auto-detect
     backend: str | None = None  # "torch", "mlx", or None for auto
     optimization_config: Any = None  # OptimizationConfig or None for engine defaults
+    output_comp_png: bool = True  # Whether to write comp PNG files
 
 
 @dataclasses.dataclass
@@ -316,11 +312,13 @@ _EXR_FLAGS = [
 # Sentinel: when color_conversion is _PNG_PREP, the writer does
 # RGB float32 → BGR uint8 conversion instead of a simple cvtColor.
 _PNG_PREP = -1
+# Sentinel: RGBA float32 → BGRA uint8 for transparent PNG output.
+_PNG_PREP_RGBA = -2
 
 
 def _write_frame_outputs(
     write_list: list[tuple[np.ndarray, str, list[int] | None, int | None]],
-) -> None:
+) -> int:
     """Prepare and write all output files for a single frame.
 
     Each entry is ``(data, path, imwrite_params, color_conversion)``.
@@ -328,10 +326,17 @@ def _write_frame_outputs(
     cv2.convertScaleAbs, and cv2.imwrite are all C code that releases
     the GIL, so writer threads truly parallelize.  The inference thread
     submits raw numpy arrays with zero prep work.
+
+    Returns total bytes written to disk.
     """
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+    total_bytes = 0
     for data, path, params, color_conv in write_list:
-        if color_conv == _PNG_PREP:
+        if color_conv == _PNG_PREP_RGBA:
+            # float32 RGBA → uint8 BGRA (all C calls, GIL-free)
+            data = cv2.cvtColor(data, cv2.COLOR_RGBA2BGRA)
+            data = cv2.convertScaleAbs(data, alpha=255.0)
+        elif color_conv == _PNG_PREP:
             # float32 RGB → uint8 BGR (all C calls, GIL-free)
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR)
             data = cv2.convertScaleAbs(data, alpha=255.0)
@@ -341,6 +346,9 @@ def _write_frame_outputs(
             cv2.imwrite(path, data, params)
         else:
             cv2.imwrite(path, data)
+        with contextlib.suppress(OSError):
+            total_bytes += os.path.getsize(path)
+    return total_bytes
 
 
 class AsyncInferencePipeline:
@@ -463,6 +471,7 @@ class AsyncInferencePipeline:
         output_dirs: dict[str, str],
         settings: InferenceSettings,
         max_frames: int | None = None,
+        on_progress: Callable[[int, int, int, int], None] | None = None,
     ) -> dict[str, Any]:
         """Run the async pipeline on a single clip.
 
@@ -512,19 +521,18 @@ class AsyncInferencePipeline:
         if self.config.read_workers:
             num_readers = self.config.read_workers
         else:
-            # Generous readers: cv2.imread is GIL-free C code, so more
-            # threads = more parallel decoding with no GIL contention.
-            # work_q backpressure prevents memory buildup.  Pre-emptive
-            # reading keeps the queue full so GPUs never stall between
-            # batches.
-            num_readers = max(4, num_gpus * 4)
+            # Readers: one per GPU is enough — inputs are small compressed
+            # files and cv2.imread is GIL-free.  Backpressure from work_q
+            # throttles them naturally.  Minimum 2 for pipelining.
+            num_readers = max(2, num_gpus)
 
         if self.config.write_workers:
             num_writers = self.config.write_workers
         else:
-            # Writers get all remaining cores.  Per-GPU pools split this
-            # total across GPUs (done below).
-            num_writers = max(4, cores - num_readers)
+            # Writers get all remaining cores — EXR PXR24 compression is
+            # CPU-heavy and dominates IO time.  Floor: at least as many
+            # writers as readers so writes never starve.
+            num_writers = max(num_readers, cores - num_readers)
 
         logger.info(
             "Worker pool: %d readers, %d writers (%d cores, %d GPUs)",
@@ -541,12 +549,43 @@ class AsyncInferencePipeline:
         pipeline_t0 = time.perf_counter()
         profiler = _TimelineProfiler(pipeline_t0)
 
+        # IO byte counters (atomic via lock-free int adds on CPython)
+        io_bytes_read = [0]
+        io_bytes_written = [0]
+
         self._shutdown_event.clear()
 
-        # --- Progress bar ---
-        from tqdm import tqdm
+        # --- Progress callback (non-blocking) ---
+        # The callback is invoked from the progress/drain thread; Rich
+        # rendering must never stall write completion, so we fire it on
+        # a separate coalescing thread that merges rapid updates.
+        _progress_pending = threading.Event()
+        _progress_done = threading.Event()
 
-        pbar = tqdm(total=num_frames, desc="CorridorKey", unit="frame", dynamic_ncols=True)
+        def _report_progress() -> None:
+            if on_progress is not None:
+                _progress_pending.set()
+
+        def _progress_callback_worker() -> None:
+            """Coalesce progress updates so Rich never blocks the drain."""
+            while not _progress_done.is_set():
+                if _progress_pending.wait(timeout=0.1):
+                    _progress_pending.clear()
+                    with contextlib.suppress(Exception):
+                        on_progress(completed_count[0], num_frames,
+                                    io_bytes_read[0], io_bytes_written[0])
+            # Final update
+            if on_progress is not None:
+                with contextlib.suppress(Exception):
+                    on_progress(completed_count[0], num_frames,
+                                io_bytes_read[0], io_bytes_written[0])
+
+        _cb_thread: threading.Thread | None = None
+        if on_progress is not None:
+            _cb_thread = threading.Thread(
+                target=_progress_callback_worker, name="progress-callback", daemon=True,
+            )
+            _cb_thread.start()
 
         # --- Flow control ---
         #
@@ -625,6 +664,12 @@ class AsyncInferencePipeline:
                     if packet is not None:
                         # Update frame size estimate
                         _last_frame_bytes[0] = packet.img_raw.nbytes + packet.mask_raw.nbytes
+                        # Track IO bytes read (file sizes on disk)
+                        with contextlib.suppress(OSError):
+                            io_bytes_read[0] += (
+                                os.path.getsize(input_paths[i])
+                                + os.path.getsize(alpha_paths[i])
+                            )
                         profiler.mark("reader", "read_done", i)
                         work_q.put(packet)
                     else:
@@ -677,8 +722,13 @@ class AsyncInferencePipeline:
             write_list: list[tuple[np.ndarray, str, list[int] | None, int | None]] = [
                 (result["fg"], os.path.join(output_dirs["fg"], f"{stem}.exr"), _EXR_FLAGS, cv2.COLOR_RGB2BGR),
                 (alpha, os.path.join(output_dirs["matte"], f"{stem}.exr"), _EXR_FLAGS, None),
-                (result["comp"], os.path.join(output_dirs["comp"], f"{stem}.png"), None, _PNG_PREP),
             ]
+            comp = result.get("comp")
+            if self.config.output_comp_png and comp is not None:
+                png_prep = _PNG_PREP_RGBA if comp.ndim == 3 and comp.shape[2] == 4 else _PNG_PREP
+                write_list.append(
+                    (comp, os.path.join(output_dirs["comp"], f"{stem}.png"), None, png_prep)
+                )
             processed = result.get("processed")
             if processed is not None:
                 write_list.append(
@@ -815,7 +865,9 @@ class AsyncInferencePipeline:
 
                     for frame_idx, fut in newly_done:
                         try:
-                            fut.result()
+                            written = fut.result()
+                            if isinstance(written, int):
+                                io_bytes_written[0] += written
                             completed_count[0] += 1
                             profiler.frame_completed()
                         except Exception as e:
@@ -823,7 +875,7 @@ class AsyncInferencePipeline:
                             with failed_lock:
                                 failed_frames.append(frame_idx)
                         resolved += 1
-                        pbar.update(1)
+                        _report_progress()
                 else:
                     if inference_done_event.is_set():
                         with write_futures_lock:
@@ -863,6 +915,7 @@ class AsyncInferencePipeline:
             inference_threads.append(t)
 
         reader_done_t = inference_done_t = pipeline_done_t = pipeline_t0
+        completed_at_infer_done = 0
 
         try:
             reader_thread.start()
@@ -880,6 +933,7 @@ class AsyncInferencePipeline:
             for t in inference_threads:
                 t.join()
             inference_done_t = time.perf_counter()
+            completed_at_infer_done = completed_count[0]
 
             # Signal drain workers to stop (one None cascades via put-back)
             write_q.put(None)
@@ -925,7 +979,10 @@ class AsyncInferencePipeline:
             progress_thread.join(timeout=5)
 
         finally:
-            pbar.close()
+            _progress_done.set()
+            _progress_pending.set()  # Wake the thread so it can exit
+            if _cb_thread is not None:
+                _cb_thread.join(timeout=2)
             shutting_down = self._shutdown_event.is_set()
             read_pool.shutdown(wait=not shutting_down, cancel_futures=shutting_down)
             write_pool.shutdown(wait=not shutting_down, cancel_futures=shutting_down)
@@ -955,6 +1012,7 @@ class AsyncInferencePipeline:
                 read_wall,
                 infer_wall,
                 write_drain,
+                completed_at_infer_done,
             )
         )
 
@@ -965,24 +1023,35 @@ class AsyncInferencePipeline:
                 peak_mb = torch.cuda.max_memory_allocated(dev_idx) / (1024**2)
                 logger.info("  Peak VRAM %s: %.0f MB (%.2f GB)", dev_str, peak_mb, peak_mb / 1024)
 
-        # Write CSV timeline for offline analysis
-        csv_path = os.path.join(
-            next(iter(output_dirs.values())) if output_dirs else ".",
-            "..",
-            "pipeline_profile.csv",
-        )
-        try:
-            csv_path = os.path.normpath(csv_path)
-            profiler.write_csv(csv_path)
-            logger.info("  Timeline CSV: %s", csv_path)
-        except Exception as e:
-            logger.debug("Could not write timeline CSV: %s", e)
+        # --- Postprocess mode hint ---
+        hint = None
+        if not self._shutdown_event.is_set() and num_frames > 10:
+            opt = self.config.optimization_config
+            gpu_pp = getattr(opt, "gpu_postprocess", True) if opt else True
+            pct_done = completed_at_infer_done / num_frames
+            early_threshold = min(0.75, 125 / num_frames)
+            late_threshold = max(0.95, 1.0 - num_writers / num_frames)
+
+            if not gpu_pp and pct_done < early_threshold:
+                hint = (
+                    f"GPU finished with only {pct_done:.0%} of frames written. "
+                    "Consider --gpu-postprocess to offload work from CPU."
+                )
+            elif gpu_pp and pct_done > late_threshold:
+                hint = (
+                    f"GPU finished with {pct_done:.0%} of frames already written. "
+                    "Consider --cpu-postprocess to free GPU time for inference."
+                )
+
+            if hint:
+                logger.info("  Hint: %s", hint)
 
         return {
             "total": num_frames,
             "completed": completed_count[0],
             "failed": num_failed,
             "skipped_frames": sorted(failed_frames),
+            "hint": hint,
         }
 
     def shutdown(self) -> None:

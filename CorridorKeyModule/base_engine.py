@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .core import color_utils as cu
-from .optimization_config import OptimizationConfig, PerformanceMetrics
+from .optimization_config import OptimizationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ class PendingTransfer:
     _cpu_result: dict[str, np.ndarray] | None  # set for CPU fallback
     _buf_released: threading.Event | None  # signalled after numpy .copy()
     _gpu_bulk: torch.Tensor | None = None  # prevents caching allocator reuse during DMA
+    _comp_channels: int = 3  # 3 for opaque checkerboard comp, 4 for transparent RGBA
 
     def resolve(self) -> dict[str, np.ndarray]:
         """Block until this transfer's DMA completes, return numpy arrays."""
@@ -76,11 +77,12 @@ class PendingTransfer:
         # Release GPU bulk tensor — DMA is done, caching allocator can reuse
         self._gpu_bulk = None
         bulk_np = self._pinned_buf.numpy()
+        cc = self._comp_channels
         result = {
             "alpha": bulk_np[:, :, 0:1].copy(),
             "fg": bulk_np[:, :, 1:4].copy(),
-            "comp": bulk_np[:, :, 4:7].copy(),
-            "processed": bulk_np[:, :, 7:11].copy(),
+            "comp": bulk_np[:, :, 4:4 + cc].copy(),
+            "processed": bulk_np[:, :, 4 + cc:4 + cc + 4].copy(),
         }
         # Signal that this buffer slot can be reused
         if self._buf_released is not None:
@@ -120,6 +122,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Cached checkerboard (per-resolution, avoids re-allocation every frame)
         self._checker_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._checker_cache_cpu: dict[tuple[int, int], np.ndarray] = {}
 
         # Dedicated copy stream for GPU→CPU transfers (avoids GIL contention
         # in multi-GPU setups).  Compute runs on the default stream; D2H
@@ -132,7 +135,7 @@ class _BaseCorridorKeyEngine(ABC):
         # that the drain sets after copying — the engine waits on it
         # before reusing the slot, making buffer corruption impossible
         # regardless of drain latency.
-        _NUM_PINNED = 3
+        _NUM_PINNED = max(2, min(3, self.config.dma_buffers))
         self._pinned_bufs: list[torch.Tensor | None] = [None] * _NUM_PINNED
         self._pinned_shapes: list[tuple] = [()] * _NUM_PINNED
         self._pinned_idx: int = 0
@@ -330,7 +333,7 @@ class _BaseCorridorKeyEngine(ABC):
         try:
             import torch_tensorrt
         except ImportError:
-            logger.info("[TensorRT] torch-tensorrt not installed — falling back to torch.compile.")
+            logger.warning("[TensorRT] torch-tensorrt not installed — falling back to torch.compile.")
             return False
 
         try:
@@ -353,7 +356,7 @@ class _BaseCorridorKeyEngine(ABC):
             return True
         except Exception as e:
             logger.warning("[TensorRT] Compilation failed: %s", e)
-            logger.info("[TensorRT] Falling back to torch.compile.")
+            logger.warning("[TensorRT] Falling back to torch.compile.")
             return False
 
     # ------------------------------------------------------------------
@@ -413,8 +416,8 @@ class _BaseCorridorKeyEngine(ABC):
     # GPU-side helpers
     # ------------------------------------------------------------------
 
-    def _get_checkerboard_gpu(self, w: int, h: int) -> torch.Tensor:
-        """Return a cached checkerboard tensor [H, W, 3] on device."""
+    def _get_checkerboard_linear_gpu(self, w: int, h: int) -> torch.Tensor:
+        """Return a cached checkerboard tensor [H, W, 3] on device in linear space."""
         key = (w, h)
         if key not in self._checker_cache:
             checker_size = 128
@@ -422,10 +425,19 @@ class _BaseCorridorKeyEngine(ABC):
             x_coords = torch.arange(w, device=self.device) // checker_size
             y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
             checker = ((x_grid + y_grid) % 2).float()
-            # Map 0 -> 0.15, 1 -> 0.55
-            bg = checker * 0.4 + 0.15  # [H, W]
-            self._checker_cache[key] = bg.unsqueeze(-1).expand(-1, -1, 3)
+            # Map 0 -> 0.15, 1 -> 0.55 (sRGB), then convert to linear before caching
+            bg_srgb = checker * 0.4 + 0.15  # [H, W]
+            bg_srgb_3 = bg_srgb.unsqueeze(-1).expand(-1, -1, 3)
+            self._checker_cache[key] = cu.srgb_to_linear(bg_srgb_3)
         return self._checker_cache[key]
+
+    def _get_checkerboard_linear_cpu(self, w: int, h: int) -> np.ndarray:
+        """Return a cached checkerboard array [H, W, 3] in linear space."""
+        key = (w, h)
+        if key not in self._checker_cache_cpu:
+            bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
+            self._checker_cache_cpu[key] = cu.srgb_to_linear(bg_srgb)
+        return self._checker_cache_cpu[key]
 
     @staticmethod
     def _clean_matte_gpu(alpha: torch.Tensor, area_threshold: int, dilation: int, blur_size: int) -> torch.Tensor:
@@ -514,10 +526,9 @@ class _BaseCorridorKeyEngine(ABC):
 
         Returns:
             Dictionary with keys ``"alpha"``, ``"fg"``, ``"comp"``,
-            ``"processed"``, and optionally ``"metrics"``.
+            and ``"processed"``.
         """
-        metrics = PerformanceMetrics() if self.config.enable_metrics else None
-        use_gpu_postprocess = self.device.type == "cuda"
+        use_gpu_postprocess = self.device.type == "cuda" and self.config.gpu_postprocess
 
         # === 1. Input normalization ===
         if image.dtype == np.uint8:
@@ -556,55 +567,34 @@ class _BaseCorridorKeyEngine(ABC):
         # === 4. Inference ===
         self._refiner_scale = refiner_scale
 
-        if metrics is not None:
-            ctx = metrics.measure("inference", self.device)
-        else:
-            from contextlib import nullcontext
-
-            ctx = nullcontext()
-
-        with ctx:
-            out = self._run_forward(inp_t)
+        out = self._run_forward(inp_t)
 
         pred_alpha = out["alpha"]  # [1, 1, model_size, model_size]
         pred_fg = out["fg"]  # [1, 3, model_size, model_size]
 
         # === 5. Post-process ===
-        if metrics is not None:
-            ctx_post = metrics.measure("postprocess", self.device)
+        if use_gpu_postprocess:
+            result = self._postprocess_gpu(
+                pred_alpha,
+                pred_fg,
+                h,
+                w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
+            )
         else:
-            from contextlib import nullcontext
-
-            ctx_post = nullcontext()
-
-        with ctx_post:
-            if use_gpu_postprocess:
-                result = self._postprocess_gpu(
-                    pred_alpha,
-                    pred_fg,
-                    h,
-                    w,
-                    auto_despeckle,
-                    despeckle_size,
-                    despill_strength,
-                    fg_is_straight,
-                )
-            else:
-                result = self._postprocess_cpu(
-                    pred_alpha,
-                    pred_fg,
-                    h,
-                    w,
-                    auto_despeckle,
-                    despeckle_size,
-                    despill_strength,
-                    fg_is_straight,
-                )
-
-        # === Finalize metrics ===
-        if metrics is not None:
-            metrics.finalize(self.device)
-            result["metrics"] = metrics
+            result = self._postprocess_cpu(
+                pred_alpha,
+                pred_fg,
+                h,
+                w,
+                auto_despeckle,
+                despeckle_size,
+                despill_strength,
+                fg_is_straight,
+            )
 
         return result
 
@@ -664,7 +654,7 @@ class _BaseCorridorKeyEngine(ABC):
         pred_fg = out["fg"]
 
         # Post-process (GPU path keeps data on device, includes .cpu() transfer)
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and self.config.gpu_postprocess:
             result = self._postprocess_gpu(
                 pred_alpha,
                 pred_fg,
@@ -823,7 +813,7 @@ class _BaseCorridorKeyEngine(ABC):
         pred_alpha = out["alpha"]
         pred_fg = out["fg"]
 
-        if use_cuda:
+        if use_cuda and self.config.gpu_postprocess:
             result = self._postprocess_gpu(
                 pred_alpha,
                 pred_fg,
@@ -886,7 +876,7 @@ class _BaseCorridorKeyEngine(ABC):
         pred_alpha = out["alpha"]
         pred_fg = out["fg"]
 
-        if use_cuda:
+        if use_cuda and self.config.gpu_postprocess:
             pending = self._postprocess_gpu(
                 pred_alpha,
                 pred_fg,
@@ -1087,12 +1077,7 @@ class _BaseCorridorKeyEngine(ABC):
             return 1
 
         free, _total = torch.cuda.mem_get_info(self.device)
-        # Per-frame activation memory at 2048²:
-        #   - Input tensor: 4 * 2048² * 4B = 64MB
-        #   - Attention buffers: ~1.5 GB (scales with sequence length²)
-        #   - Intermediate features: ~300 MB
-        # Total ~2 GB per frame in batch
-        per_frame_mb = 2048
+        per_frame_mb = 2048  # ~2 GB per frame at 2048² (activations + attention)
         available_mb = (free * 0.7) / (1024**2)
         batch = max(1, int(available_mb / per_frame_mb))
         return min(batch, 8)  # cap at 8
@@ -1142,26 +1127,35 @@ class _BaseCorridorKeyEngine(ABC):
         # E. Pack RGBA on GPU
         processed_rgba = torch.cat([fg_premul_lin, processed_alpha], dim=-1)
 
-        # F. Composite on checkerboard (GPU)
-        bg_srgb = self._get_checkerboard_gpu(w, h)
-        bg_lin = cu.srgb_to_linear(bg_srgb)
-
-        if fg_is_straight:
-            comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+        # F. Composite (optional — skip if comp PNG is disabled)
+        if self.config.output_comp_png:
+            if self.config.comp_checkerboard:
+                bg_lin = self._get_checkerboard_linear_gpu(w, h)
+                if fg_is_straight:
+                    comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+                else:
+                    comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+                comp_srgb = cu.linear_to_srgb(comp_lin)  # [H, W, 3] opaque
+            else:
+                # Transparent RGBA: straight fg in sRGB + alpha
+                fg_srgb = cu.linear_to_srgb(fg_despilled_lin)
+                comp_srgb = torch.cat([fg_srgb, processed_alpha], dim=-1)  # [H, W, 4]
         else:
-            comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
-
-        comp_srgb = cu.linear_to_srgb(comp_lin)
+            comp_srgb = None
 
         # === Bulk transfer to CPU via copy stream ===
         #
         # Pack all outputs into one contiguous tensor, DMA to a pinned
-        # buffer on the copy stream.  Double-buffered: alternates between
-        # two pinned buffers so deferred DMA from frame N doesn't conflict
-        # with frame N+1's transfer.
-        #
-        # Layout: [H, W, 1+3+3+4] = [alpha, fg, comp, processed]
-        bulk = torch.cat([res_alpha, res_fg, comp_srgb, processed_rgba], dim=-1)
+        # buffer on the copy stream.  Layout varies by comp mode:
+        #   Checkerboard: [H, W, 1+3+3+4] = [alpha, fg, comp_rgb, processed]
+        #   Transparent:  [H, W, 1+3+4+4] = [alpha, fg, comp_rgba, processed]
+        #   No comp:      [H, W, 1+3+3+4] = [alpha, fg, zeros, processed]
+        if comp_srgb is not None:
+            comp_channels = comp_srgb.shape[-1]
+            bulk = torch.cat([res_alpha, res_fg, comp_srgb, processed_rgba], dim=-1)
+        else:
+            comp_channels = 3
+            bulk = torch.cat([res_alpha, res_fg, torch.zeros_like(res_fg), processed_rgba], dim=-1)
 
         if self._copy_stream is not None:
             # Select pinned buffer and rotate index for next call
@@ -1192,25 +1186,29 @@ class _BaseCorridorKeyEngine(ABC):
                 # only for THIS transfer, not later ones that may reuse
                 # the same pinned buffer.
                 dma_event = self._copy_stream.record_event()
-                return PendingTransfer(dma_event, pinned, None, self._pinned_released[idx], bulk)
+                pt = PendingTransfer(dma_event, pinned, None, self._pinned_released[idx], bulk)
+                pt._comp_channels = comp_channels
+                return pt
 
             # Sync path: block until DMA completes, return numpy with .copy()
             self._copy_stream.synchronize()
             bulk_np = pinned.numpy()
+            cc = comp_channels
             result = {
                 "alpha": bulk_np[:, :, 0:1].copy(),
                 "fg": bulk_np[:, :, 1:4].copy(),
-                "comp": bulk_np[:, :, 4:7].copy(),
-                "processed": bulk_np[:, :, 7:11].copy(),
+                "comp": bulk_np[:, :, 4:4 + cc].copy(),
+                "processed": bulk_np[:, :, 4 + cc:4 + cc + 4].copy(),
             }
             self._pinned_released[idx].set()
             return result
         bulk_np = bulk.cpu().numpy()
+        cc = comp_channels
         result = {
             "alpha": bulk_np[:, :, 0:1],
             "fg": bulk_np[:, :, 1:4],
-            "comp": bulk_np[:, :, 4:7],
-            "processed": bulk_np[:, :, 7:11],
+            "comp": bulk_np[:, :, 4:4 + cc],
+            "processed": bulk_np[:, :, 4 + cc:4 + cc + 4],
         }
         if not sync:
             return PendingTransfer(None, None, result, None)
@@ -1246,19 +1244,26 @@ class _BaseCorridorKeyEngine(ABC):
         fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
         processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
 
-        bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
-        bg_lin = cu.srgb_to_linear(bg_srgb)
-
-        if fg_is_straight:
-            comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+        if self.config.output_comp_png:
+            if self.config.comp_checkerboard:
+                bg_lin = self._get_checkerboard_linear_cpu(w, h)
+                if fg_is_straight:
+                    comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+                else:
+                    comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+                comp_srgb = cu.linear_to_srgb(comp_lin)  # [H, W, 3] opaque
+            else:
+                # Transparent RGBA: straight fg in sRGB + alpha
+                fg_srgb = cu.linear_to_srgb(fg_despilled_lin)
+                comp_srgb = np.concatenate([fg_srgb, processed_alpha], axis=-1)  # [H, W, 4]
         else:
-            comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+            comp_srgb = None
 
-        comp_srgb = cu.linear_to_srgb(comp_lin)
-
-        return {
+        result = {
             "alpha": res_alpha,
             "fg": res_fg,
-            "comp": comp_srgb,
             "processed": processed_rgba,
         }
+        if comp_srgb is not None:
+            result["comp"] = comp_srgb
+        return result
