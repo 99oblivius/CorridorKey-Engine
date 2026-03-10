@@ -21,6 +21,7 @@ import dataclasses
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -605,7 +606,8 @@ class AsyncInferencePipeline:
         _last_frame_bytes = [0]  # estimated from last completed read
 
         def _available_ram() -> int:
-            """Available system memory in bytes (Linux fast path)."""
+            """Available system memory in bytes (cross-platform)."""
+            # Linux fast path
             try:
                 with open("/proc/meminfo") as f:
                     for line in f:
@@ -613,8 +615,35 @@ class AsyncInferencePipeline:
                             return int(line.split()[1]) * 1024
             except OSError:
                 pass
-            # Fallback
-            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            # Windows
+            if sys.platform == "win32":
+                import ctypes
+
+                class _MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                stat = _MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(stat)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[union-attr]
+                    return stat.ullAvailPhys
+            # Unix fallback (macOS lacks SC_AVPHYS_PAGES so this raises
+            # ValueError there — falls through to the conservative 4 GB
+            # default, which degrades memory-aware read throttling.
+            # TODO: add macOS-specific path via sysctl vm.page_free_count)
+            try:
+                return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            except (AttributeError, ValueError):
+                return _MEM_HEADROOM * 4  # conservative default
 
         def reader_task(read_pool: ThreadPoolExecutor) -> None:
             """Submit frame reads incrementally, feed work_q as reads complete.

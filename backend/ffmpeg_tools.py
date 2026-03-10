@@ -206,7 +206,7 @@ def extract_frames(
             str(start_frame),
             "-vsync",
             "passthrough",
-            out_dir + "/" + pattern,
+            os.path.join(out_dir, pattern),
             "-y",
         ]
     else:
@@ -218,7 +218,7 @@ def extract_frames(
             "0",
             "-vsync",
             "passthrough",
-            out_dir + "/" + pattern,
+            os.path.join(out_dir, pattern),
             "-y",
         ]
 
