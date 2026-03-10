@@ -14,6 +14,7 @@ Why mock the model?
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 # ---------------------------------------------------------------------------
@@ -107,9 +108,8 @@ class TestProcessFrameColorSpace:
         """Default sRGB path should not crash and should return valid outputs."""
         engine = _make_engine_with_mock(mock_greenformer)
         result = engine.process_frame(sample_frame_rgb, sample_mask, input_is_linear=False)
-        # Comp should be in [0, 1] range (sRGB, clipped)
-        assert result["comp"].min() >= -0.01
-        assert result["comp"].max() <= 1.01
+
+        np.testing.assert_allclose(result["comp"], 0.545655, atol=1e-4)
 
     def test_linear_input_path(self, sample_frame_rgb, sample_mask, mock_greenformer):
         """Linear input path should convert to sRGB before model input."""
@@ -135,15 +135,21 @@ class TestProcessFramePostProcessing:
     """Verify post-processing: despill, despeckle, premultiply, composite."""
 
     def test_despill_strength_variants_dont_crash(self, sample_frame_rgb, sample_mask, mock_greenformer):
-        """Despill at strength 0.0 and 1.0 should both produce valid outputs."""
+        """Despill at strength 0.0 and 1.0 should both produce valid outputs.
+
+        With mock fg=0.6 (uniform), despill has zero effect (green is not above
+        the R/B average), so both strengths produce identical premultiplied RGB.
+        """
         engine = _make_engine_with_mock(mock_greenformer)
         result_no_despill = engine.process_frame(sample_frame_rgb, sample_mask, despill_strength=0.0)
         result_full_despill = engine.process_frame(sample_frame_rgb, sample_mask, despill_strength=1.0)
-        # Both despill extremes should produce identically shaped outputs
-        # without raising. (With a mocked model the despill math runs on
-        # uniform 0.6 FG values, so we can't assert meaningful color
-        # differences — that needs a real model integration test.)
-        assert result_no_despill["processed"].shape == result_full_despill["processed"].shape
+
+        rgb_none = result_no_despill["processed"][:, :, :3]
+        rgb_full = result_full_despill["processed"][:, :, :3]
+
+        np.testing.assert_allclose(rgb_none, 0.2548, atol=1e-3)
+        assert rgb_none.shape == rgb_full.shape
+        np.testing.assert_allclose(rgb_none, rgb_full, atol=1e-7)
 
     def test_auto_despeckle_toggle(self, sample_frame_rgb, sample_mask, mock_greenformer):
         """auto_despeckle=False should skip clean_matte without crashing."""
@@ -158,6 +164,8 @@ class TestProcessFramePostProcessing:
         an Over operation. The RGB channels should be <= alpha (premultiplied
         means color is already multiplied by alpha).
         """
+        from CorridorKeyModule.core.color_utils import srgb_to_linear
+
         engine = _make_engine_with_mock(mock_greenformer)
         result = engine.process_frame(sample_frame_rgb, sample_mask)
         processed = result["processed"]
@@ -165,10 +173,9 @@ class TestProcessFramePostProcessing:
 
         rgb = processed[:, :, :3]
         alpha = processed[:, :, 3:4]
-        # In a correctly premultiplied image, RGB <= alpha (with small tolerance
-        # for floating point). Check that the mean holds — individual pixels
-        # may have tiny overflows from despill redistribution.
-        assert rgb.mean() <= alpha.mean() + 0.05
+        expected_premul = float(srgb_to_linear(np.float32(0.6))) * 0.8
+        np.testing.assert_allclose(alpha, 0.8, atol=1e-5)
+        np.testing.assert_allclose(rgb, expected_premul, atol=1e-2)
 
     def test_mask_2d_vs_3d_input(self, sample_frame_rgb, mock_greenformer):
         """process_frame should accept both [H, W] and [H, W, 1] masks."""
@@ -181,3 +188,75 @@ class TestProcessFramePostProcessing:
 
         # Both should produce the same output
         np.testing.assert_allclose(result_2d["alpha"], result_3d["alpha"], atol=1e-5)
+
+    def test_refiner_scale_parameter_accepted(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        """Non-default refiner_scale must not raise — the parameter must be threaded through."""
+        engine = _make_engine_with_mock(mock_greenformer)
+        result = engine.process_frame(sample_frame_rgb, sample_mask, refiner_scale=0.5)
+        assert result["alpha"].shape[:2] == sample_frame_rgb.shape[:2]
+
+
+# ---------------------------------------------------------------------------
+# Output value range checks
+# ---------------------------------------------------------------------------
+
+
+class TestProcessFrameValueRanges:
+    """Verify that output values stay within compositing-safe ranges."""
+
+    def test_alpha_output_range_is_zero_to_one(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        """Alpha output must be in [0, 1] — values outside this range corrupt compositing."""
+        engine = _make_engine_with_mock(mock_greenformer)
+        result = engine.process_frame(sample_frame_rgb, sample_mask)
+        alpha = result["alpha"]
+        assert alpha.min() >= -0.01, f"alpha min {alpha.min():.4f} is below 0"
+        assert alpha.max() <= 1.01, f"alpha max {alpha.max():.4f} is above 1"
+
+    def test_fg_output_range_is_zero_to_one(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        """FG output must be in [0, 1] — required for downstream sRGB conversion and EXR export."""
+        engine = _make_engine_with_mock(mock_greenformer)
+        result = engine.process_frame(sample_frame_rgb, sample_mask)
+        fg = result["fg"]
+        assert fg.min() >= -0.01, f"fg min {fg.min():.4f} is below 0"
+        assert fg.max() <= 1.01, f"fg max {fg.max():.4f} is above 1"
+
+    def test_model_called_exactly_once(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        """The neural network model must be called exactly once per process_frame() call.
+
+        Double-inference would double latency and produce incorrect outputs.
+        """
+        engine = _make_engine_with_mock(mock_greenformer)
+        engine.process_frame(sample_frame_rgb, sample_mask)
+        assert mock_greenformer.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA Specific GPU test
+# ---------------------------------------------------------------------------
+
+
+class TestNvidiaGPUProcess:
+    @pytest.mark.gpu
+    def test_process_frame_on_gpu(self, sample_frame_rgb, sample_mask, mock_greenformer):
+        """Process a frame on CUDA to verify cross-device compatibility."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        import threading
+
+        engine = _make_engine_with_mock(mock_greenformer)
+        engine.device = torch.device("cuda")
+        engine._mean_t = engine._mean_t.to("cuda")
+        engine._std_t = engine._std_t.to("cuda")
+        engine._copy_stream = torch.cuda.Stream(device=engine.device)
+        _NUM_PINNED = 3
+        engine._pinned_bufs = [None] * _NUM_PINNED
+        engine._pinned_shapes = [()] * _NUM_PINNED
+        engine._pinned_idx = 0
+        engine._num_pinned = _NUM_PINNED
+        engine._pinned_released = [threading.Event() for _ in range(_NUM_PINNED)]
+        for ev in engine._pinned_released:
+            ev.set()
+
+        result = engine.process_frame(sample_frame_rgb, sample_mask)
+        assert result["alpha"].dtype == np.float32

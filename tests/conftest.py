@@ -146,8 +146,8 @@ def mock_greenformer():
     def fake_forward(x):
         b, _c, h, w = x.shape
         return {
-            "alpha": torch.full((b, 1, h, w), 0.8),
-            "fg": torch.full((b, 3, h, w), 0.6),
+            "alpha": torch.full((b, 1, h, w), 0.8, device=x.device),
+            "fg": torch.full((b, 3, h, w), 0.6, device=x.device),
         }
 
     model = MagicMock()

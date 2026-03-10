@@ -217,10 +217,6 @@ class ResultPacket:
     processed: np.ndarray | None
 
 
-def _is_image_file(filename: str) -> bool:
-    return filename.lower().endswith((".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".bmp"))
-
-
 def _read_input_frame(
     path: str,
     is_exr: bool,
@@ -298,14 +294,6 @@ def _read_frame_pair(
         orig_h=orig_h,
         orig_w=orig_w,
     )
-
-
-def _read_video_frame(cap: cv2.VideoCapture) -> np.ndarray | None:
-    """Read one frame from a VideoCapture, return RGB float32 or None."""
-    ret, frame = cap.read()
-    if not ret:
-        return None
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
 
 # ---- Write helpers ----

@@ -284,10 +284,6 @@ class GreenFormer(nn.Module):
             self.refiner = None
             logger.info("Refiner Module DISABLED (Backbone Only Mode).")
 
-    # kept for backward compat; delegates to the module-level function
-    def _patch_input_layer(self, in_channels: int) -> None:
-        patch_input_layer(self.encoder, in_channels)
-
     # ------------------------------------------------------------------
     # Decode + Refine pipeline (shared with subclasses)
     # ------------------------------------------------------------------
