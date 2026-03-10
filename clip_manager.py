@@ -682,7 +682,7 @@ def run_inference(
         optimization_config=optimization_config,
         read_workers=read_workers,
         write_workers=write_workers,
-        output_comp_png=getattr(optimization_config, 'output_comp_png', True) if optimization_config else True,
+        output_comp_png=getattr(optimization_config, "output_comp_png", True) if optimization_config else True,
     )
     pipeline = AsyncInferencePipeline(config)
     pipeline.load_engines()
@@ -914,5 +914,3 @@ def scan_clips() -> list[ClipEntry]:
         logger.info("All clip folders appear valid.")
 
     return valid_clips
-
-

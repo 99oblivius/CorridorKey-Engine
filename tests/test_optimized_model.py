@@ -308,6 +308,7 @@ class TestOptimizedEngineAPI:
         engine._mean_t = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         engine._std_t = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         engine._checker_cache = {}
+        engine._checker_cache_cpu = {}
         engine._refiner_scale = 1.0
         engine._refiner_hook_handle = None
         engine._cuda_graph = None
@@ -332,7 +333,7 @@ class TestOptimizedEngineAPI:
         h, w = sample_frame_rgb.shape[:2]
         assert result["alpha"].shape == (h, w, 1)
         assert result["fg"].shape == (h, w, 3)
-        assert result["comp"].shape == (h, w, 3)
+        assert result["comp"].shape == (h, w, 4)
         assert result["processed"].shape == (h, w, 4)
 
     def test_output_dtypes(self, sample_frame_rgb, sample_mask):

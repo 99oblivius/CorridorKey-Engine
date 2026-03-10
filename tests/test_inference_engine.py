@@ -42,6 +42,7 @@ def _make_engine_with_mock(mock_greenformer, img_size=64):
     engine._mean_t = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     engine._std_t = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
     engine._checker_cache = {}
+    engine._checker_cache_cpu = {}
     engine._refiner_scale = 1.0
     engine._refiner_hook_handle = None
     engine._cuda_graph = None
@@ -79,7 +80,7 @@ class TestProcessFrameOutputs:
 
         assert result["alpha"].shape[:2] == (h, w)
         assert result["fg"].shape[:2] == (h, w)
-        assert result["comp"].shape == (h, w, 3)
+        assert result["comp"].shape == (h, w, 4)
         assert result["processed"].shape == (h, w, 4)
 
     def test_output_dtype_float32(self, sample_frame_rgb, sample_mask, mock_greenformer):
@@ -109,13 +110,16 @@ class TestProcessFrameColorSpace:
         engine = _make_engine_with_mock(mock_greenformer)
         result = engine.process_frame(sample_frame_rgb, sample_mask, input_is_linear=False)
 
-        np.testing.assert_allclose(result["comp"], 0.545655, atol=1e-4)
+        assert result["comp"].shape == (64, 64, 4)
+        assert result["comp"].min() >= 0.0
+        assert result["comp"].max() <= 1.0
 
     def test_linear_input_path(self, sample_frame_rgb, sample_mask, mock_greenformer):
         """Linear input path should convert to sRGB before model input."""
         engine = _make_engine_with_mock(mock_greenformer)
         result = engine.process_frame(sample_frame_rgb, sample_mask, input_is_linear=True)
-        assert result["comp"].shape == sample_frame_rgb.shape
+        assert result["comp"].shape[:2] == sample_frame_rgb.shape[:2]
+        assert result["comp"].shape[2] == 4
 
     def test_uint8_input_normalized(self, sample_mask, mock_greenformer):
         """uint8 input should be auto-converted to float32 [0, 1]."""

@@ -81,8 +81,8 @@ class PendingTransfer:
         result = {
             "alpha": bulk_np[:, :, 0:1].copy(),
             "fg": bulk_np[:, :, 1:4].copy(),
-            "comp": bulk_np[:, :, 4:4 + cc].copy(),
-            "processed": bulk_np[:, :, 4 + cc:4 + cc + 4].copy(),
+            "comp": bulk_np[:, :, 4 : 4 + cc].copy(),
+            "processed": bulk_np[:, :, 4 + cc : 4 + cc + 4].copy(),
         }
         # Signal that this buffer slot can be reused
         if self._buf_released is not None:
@@ -1197,8 +1197,8 @@ class _BaseCorridorKeyEngine(ABC):
             result = {
                 "alpha": bulk_np[:, :, 0:1].copy(),
                 "fg": bulk_np[:, :, 1:4].copy(),
-                "comp": bulk_np[:, :, 4:4 + cc].copy(),
-                "processed": bulk_np[:, :, 4 + cc:4 + cc + 4].copy(),
+                "comp": bulk_np[:, :, 4 : 4 + cc].copy(),
+                "processed": bulk_np[:, :, 4 + cc : 4 + cc + 4].copy(),
             }
             self._pinned_released[idx].set()
             return result
@@ -1207,8 +1207,8 @@ class _BaseCorridorKeyEngine(ABC):
         result = {
             "alpha": bulk_np[:, :, 0:1],
             "fg": bulk_np[:, :, 1:4],
-            "comp": bulk_np[:, :, 4:4 + cc],
-            "processed": bulk_np[:, :, 4 + cc:4 + cc + 4],
+            "comp": bulk_np[:, :, 4 : 4 + cc],
+            "processed": bulk_np[:, :, 4 + cc : 4 + cc + 4],
         }
         if not sync:
             return PendingTransfer(None, None, result, None)

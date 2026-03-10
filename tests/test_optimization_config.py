@@ -112,4 +112,3 @@ class TestOptimizationConfigHelpers:
         summary = cfg.summary()
         assert "flash_attention" in summary
         assert "tiled_refiner" in summary
-

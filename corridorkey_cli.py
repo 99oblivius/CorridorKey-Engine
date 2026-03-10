@@ -230,17 +230,23 @@ class ProgressContext:
         self._io_tracker = _IOSpeedTracker(window=3.0)
 
     def on_frame_complete(
-        self, completed: int, num_frames: int,
-        bytes_read: int = 0, bytes_written: int = 0,
+        self,
+        completed: int,
+        num_frames: int,
+        bytes_read: int = 0,
+        bytes_written: int = 0,
     ) -> None:
         """Callback: set progress to the absolute completed count."""
         if self._frame_task_id is not None:
             import time as _time
+
             self._io_tracker.record(_time.monotonic(), bytes_read, bytes_written)
             r_speed, w_speed = self._io_tracker.speeds()
             self._progress.update(
-                self._frame_task_id, completed=completed,
-                io_r_speed=r_speed, io_w_speed=w_speed,
+                self._frame_task_id,
+                completed=completed,
+                io_r_speed=r_speed,
+                io_w_speed=w_speed,
             )
 
 
@@ -308,8 +314,7 @@ def _prompt_inference_settings(
         else:
             while True:
                 raw = _readline_input(
-                    "Despill strength [cyan](0-10, 10 = max despill)[/cyan]"
-                    " [cyan](5)[/cyan]",
+                    "Despill strength [cyan](0-10, 10 = max despill)[/cyan] [cyan](5)[/cyan]",
                 )
                 val = raw.strip()
                 if not val:
@@ -357,8 +362,7 @@ def _prompt_inference_settings(
         if auto_despeckle and default_despeckle_size is None and default_despeckle is None:
             while True:
                 raw = _readline_input(
-                    "Despeckle size [cyan](min pixels for a spot)[/cyan]"
-                    " [cyan](400)[/cyan]",
+                    "Despeckle size [cyan](min pixels for a spot)[/cyan] [cyan](400)[/cyan]",
                 )
                 val = raw.strip()
                 if not val:
@@ -379,8 +383,7 @@ def _prompt_inference_settings(
         else:
             while True:
                 raw = _readline_input(
-                    "Refiner strength multiplier [dim](experimental)[/dim]"
-                    " [cyan](1.0)[/cyan]",
+                    "Refiner strength multiplier [dim](experimental)[/dim] [cyan](1.0)[/cyan]",
                 )
                 val = raw.strip()
                 if not val:
@@ -457,9 +460,14 @@ def _build_optimization_config(
                     gpu_postprocess,
                 ]
             )
-            or comp_checkerboard or no_comp_png or token_routing or tensorrt
-            or dma_buffers != 2 or precision != "fp16"
-            or tile_size != 512 or tile_overlap != 128
+            or comp_checkerboard
+            or no_comp_png
+            or token_routing
+            or tensorrt
+            or dma_buffers != 2
+            or precision != "fp16"
+            or tile_size != 512
+            or tile_overlap != 128
         )
         if not has_overrides:
             return None
@@ -493,8 +501,11 @@ def _build_optimization_config(
     if dma_buffers != 2:
         overrides["dma_buffers"] = dma_buffers
     _precision_aliases = {
-        "fp16": "float16", "fp32": "float32", "bf16": "bfloat16",
-        "half": "float16", "float": "float32",
+        "fp16": "float16",
+        "fp32": "float32",
+        "bf16": "bfloat16",
+        "half": "float16",
+        "float": "float32",
     }
     resolved_precision = _precision_aliases.get(precision, precision)
     if resolved_precision != "float16":
@@ -971,15 +982,19 @@ def interactive_wizard(
 
         # 3. Organize
         try:
-            organize = _readline_input(
-                "\nOrganize clips & create hint folders?"
-                " [bold magenta]\\[[/bold magenta]"
-                "[bold magenta]y[/bold magenta][magenta]es[/magenta]"
-                "[bold magenta]/[/bold magenta]"
-                "[bold magenta]n[/bold magenta][magenta]o[/magenta]"
-                "[bold magenta]][/bold magenta]"
-                " [cyan](no)[/cyan]",
-            ).strip().lower()
+            organize = (
+                _readline_input(
+                    "\nOrganize clips & create hint folders?"
+                    " [bold magenta]\\[[/bold magenta]"
+                    "[bold magenta]y[/bold magenta][magenta]es[/magenta]"
+                    "[bold magenta]/[/bold magenta]"
+                    "[bold magenta]n[/bold magenta][magenta]o[/magenta]"
+                    "[bold magenta]][/bold magenta]"
+                    " [cyan](no)[/cyan]",
+                )
+                .strip()
+                .lower()
+            )
         except EOFError:
             organize = "n"
 
@@ -1085,9 +1100,7 @@ def interactive_wizard(
             if missing_alpha:
                 actions.append(f"[bold]v[/bold] -- Run VideoMaMa ({len(masked)} with masks)")
                 actions.append(f"[bold]g[/bold] -- Run GVM (auto-matte {len(raw)} clips)")
-                actions.append(
-                    f"[bold]b[/bold] -- Run BiRefNet (lightweight auto-matte {len(raw)} clips, ~4GB VRAM)"
-                )
+                actions.append(f"[bold]b[/bold] -- Run BiRefNet (lightweight auto-matte {len(raw)} clips, ~4GB VRAM)")
             if ready:
                 actions.append(f"[bold]i[/bold] -- Run Inference ({len(ready)} ready clips)")
             actions.append("[bold]r[/bold] -- Re-scan folders")
@@ -1156,15 +1169,19 @@ def interactive_wizard(
                 sys.stdout.write(g_info)
                 sys.stdout.flush()
                 try:
-                    gvm_yes = _readline_input(
-                        "Proceed with GVM?"
-                        " [bold magenta]\\[[/bold magenta]"
-                        "[bold magenta]y[/bold magenta][magenta]es[/magenta]"
-                        "[bold magenta]/[/bold magenta]"
-                        "[bold magenta]n[/bold magenta][magenta]o[/magenta]"
-                        "[bold magenta]][/bold magenta]"
-                        " [cyan](no)[/cyan]",
-                    ).strip().lower()
+                    gvm_yes = (
+                        _readline_input(
+                            "Proceed with GVM?"
+                            " [bold magenta]\\[[/bold magenta]"
+                            "[bold magenta]y[/bold magenta][magenta]es[/magenta]"
+                            "[bold magenta]/[/bold magenta]"
+                            "[bold magenta]n[/bold magenta][magenta]o[/magenta]"
+                            "[bold magenta]][/bold magenta]"
+                            " [cyan](no)[/cyan]",
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if gvm_yes in ("y", "yes"):
                         try:
                             generate_alphas(raw, device=device)
@@ -1190,23 +1207,25 @@ def interactive_wizard(
                 sys.stdout.write(b_hdr)
                 sys.stdout.flush()
                 with console.capture() as cap_b2:
-                    console.print(
-                        f"Will generate alphas for {len(raw)} clips using BiRefNet (~4GB VRAM)."
-                    )
+                    console.print(f"Will generate alphas for {len(raw)} clips using BiRefNet (~4GB VRAM).")
                 b_info = cap_b2.get()
                 b_lines += b_info.count("\n")
                 sys.stdout.write(b_info)
                 sys.stdout.flush()
                 try:
-                    biref_yes = _readline_input(
-                        "Proceed with BiRefNet?"
-                        " [bold magenta]\\[[/bold magenta]"
-                        "[bold magenta]y[/bold magenta][magenta]es[/magenta]"
-                        "[bold magenta]/[/bold magenta]"
-                        "[bold magenta]n[/bold magenta][magenta]o[/magenta]"
-                        "[bold magenta]][/bold magenta]"
-                        " [cyan](no)[/cyan]",
-                    ).strip().lower()
+                    biref_yes = (
+                        _readline_input(
+                            "Proceed with BiRefNet?"
+                            " [bold magenta]\\[[/bold magenta]"
+                            "[bold magenta]y[/bold magenta][magenta]es[/magenta]"
+                            "[bold magenta]/[/bold magenta]"
+                            "[bold magenta]n[/bold magenta][magenta]o[/magenta]"
+                            "[bold magenta]][/bold magenta]"
+                            " [cyan](no)[/cyan]",
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if biref_yes in ("y", "yes"):
                         try:
                             generate_alphas_birefnet(raw, device=device)

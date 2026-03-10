@@ -572,18 +572,18 @@ class AsyncInferencePipeline:
                 if _progress_pending.wait(timeout=0.1):
                     _progress_pending.clear()
                     with contextlib.suppress(Exception):
-                        on_progress(completed_count[0], num_frames,
-                                    io_bytes_read[0], io_bytes_written[0])
+                        on_progress(completed_count[0], num_frames, io_bytes_read[0], io_bytes_written[0])
             # Final update
             if on_progress is not None:
                 with contextlib.suppress(Exception):
-                    on_progress(completed_count[0], num_frames,
-                                io_bytes_read[0], io_bytes_written[0])
+                    on_progress(completed_count[0], num_frames, io_bytes_read[0], io_bytes_written[0])
 
         _cb_thread: threading.Thread | None = None
         if on_progress is not None:
             _cb_thread = threading.Thread(
-                target=_progress_callback_worker, name="progress-callback", daemon=True,
+                target=_progress_callback_worker,
+                name="progress-callback",
+                daemon=True,
             )
             _cb_thread.start()
 
@@ -666,10 +666,7 @@ class AsyncInferencePipeline:
                         _last_frame_bytes[0] = packet.img_raw.nbytes + packet.mask_raw.nbytes
                         # Track IO bytes read (file sizes on disk)
                         with contextlib.suppress(OSError):
-                            io_bytes_read[0] += (
-                                os.path.getsize(input_paths[i])
-                                + os.path.getsize(alpha_paths[i])
-                            )
+                            io_bytes_read[0] += os.path.getsize(input_paths[i]) + os.path.getsize(alpha_paths[i])
                         profiler.mark("reader", "read_done", i)
                         work_q.put(packet)
                     else:
@@ -726,9 +723,7 @@ class AsyncInferencePipeline:
             comp = result.get("comp")
             if self.config.output_comp_png and comp is not None:
                 png_prep = _PNG_PREP_RGBA if comp.ndim == 3 and comp.shape[2] == 4 else _PNG_PREP
-                write_list.append(
-                    (comp, os.path.join(output_dirs["comp"], f"{stem}.png"), None, png_prep)
-                )
+                write_list.append((comp, os.path.join(output_dirs["comp"], f"{stem}.png"), None, png_prep))
             processed = result.get("processed")
             if processed is not None:
                 write_list.append(
