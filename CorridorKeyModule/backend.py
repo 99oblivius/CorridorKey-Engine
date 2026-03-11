@@ -218,11 +218,17 @@ class _MLXEngineAdapter:
         return _wrap_mlx_output(raw, despill_strength, auto_despeckle, despeckle_size)
 
 
+DEFAULT_MLX_TILE_SIZE = 512
+DEFAULT_MLX_TILE_OVERLAP = 64
+
+
 def create_engine(
     backend: str | None = None,
     device: str | None = None,
     img_size: int = DEFAULT_IMG_SIZE,
     optimization_config: object | None = None,
+    tile_size: int | None = DEFAULT_MLX_TILE_SIZE,
+    overlap: int = DEFAULT_MLX_TILE_OVERLAP,
 ) -> object:
     """Factory: returns an engine with process_frame() matching the Torch contract.
 
@@ -233,6 +239,9 @@ def create_engine(
         optimization_config: Optional :class:`OptimizationConfig` to pass
             through to the engine.  When ``None``, each backend uses its
             own default profile.
+        tile_size: MLX only — tile size for tiled inference (default 512).
+            Set to None to disable tiling and use full-frame inference.
+        overlap: MLX only — overlap pixels between tiles (default 64).
     """
     backend = resolve_backend(backend)
 
@@ -240,8 +249,9 @@ def create_engine(
         ckpt = _discover_checkpoint(MLX_EXT)
         from corridorkey_mlx import CorridorKeyMLXEngine
 
-        raw_engine = CorridorKeyMLXEngine(str(ckpt), img_size=img_size)
-        logger.info("MLX engine loaded: %s", ckpt.name)
+        raw_engine = CorridorKeyMLXEngine(str(ckpt), img_size=img_size, tile_size=tile_size, overlap=overlap)
+        mode = f"tiled (tile={tile_size}, overlap={overlap})" if tile_size else "full-frame"
+        logger.info("MLX engine loaded: %s [%s]", ckpt.name, mode)
         return _MLXEngineAdapter(raw_engine)
     if backend == "torch_optimized":
         ckpt = _discover_checkpoint(TORCH_EXT)
