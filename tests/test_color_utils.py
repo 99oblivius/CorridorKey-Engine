@@ -304,6 +304,14 @@ class TestDespill:
         result_t = cu.despill(img_t, green_limit_mode="average", strength=1.0)
         np.testing.assert_allclose(result_np, result_t.numpy(), atol=1e-5)
 
+    def test_green_below_limit_unchanged_numpy(self):
+        """spill_amount is clamped to zero when G < (R+B)/2 — pixel is returned unchanged."""
+        # G=0.3 is well below the average limit (0.8+0.6)/2 = 0.7
+        # spill_amount = max(0.3 - 0.7, 0) = 0  →  output equals input
+        img = _to_np([[0.8, 0.3, 0.6]])
+        result = cu.despill(img, green_limit_mode="average", strength=1.0)
+        np.testing.assert_allclose(result, img, atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # clean_matte
