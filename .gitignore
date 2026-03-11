@@ -52,5 +52,6 @@ tears_of_steel_test/alpha_hints/
 tears_of_steel_test/*.exr
 tears_of_steel_test/*.png
 *.mp4
+site
 .omc/
 .sisyphus/
