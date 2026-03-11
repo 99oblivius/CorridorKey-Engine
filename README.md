@@ -30,7 +30,7 @@ Fork of [nikopueringer/CorridorKey](https://github.com/nikopueringer/CorridorKey
 12 GB GPU recommended. The 2048 profile compilation and 4K inference fits in 8-12 GB. 1024 img_size fits in 2-3 GB.
 Running on a GPU that is not driving your display avoids OOM from compositor overhead.
 
-**Windows:** NVIDIA drivers must support CUDA 12.6+.
+**Windows:** NVIDIA drivers must support CUDA 12.8+.
 
 ## Installation
 
