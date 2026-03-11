@@ -176,7 +176,7 @@ No GPU or model weights required.
 ## Acknowledgements
 
 - [Corridor Digital](https://github.com/nikopueringer/CorridorKey) -- original CorridorKey model and codebase
-- [GVM](https://github.com/aim-uofa/GVM) (AIM, Zhejiang University) -- CC BY-NC-SA 4.0
+- [GVM](https://github.com/aim-uofa/GVM) (AIM, Zhejiang University) -- BSD-2-Clause
 - [VideoMaMa](https://github.com/cvlab-kaist/VideoMaMa) (CVLAB, KAIST) -- CC BY-NC 4.0, model checkpoints under [Stability AI Community License](https://stability.ai/license)
 - [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) -- MIT
 
