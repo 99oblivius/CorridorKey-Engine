@@ -5,7 +5,7 @@ Format: OpenEXR 16-bit half-float, 4096x2160, linear color space
 License: CC-BY 3.0 (c) Blender Foundation | mango.blender.org
 
 Usage:
-    python tears_of_steel_test/download_frames.py
+    uv run python tools/benchmarks/download_frames.py
 """
 
 import os
@@ -14,7 +14,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_URL = "https://media.xiph.org/tearsofsteel/tearsofsteel-footage-exr/02_3c/linear/"
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "frames")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "benchmark", "frames")
 NUM_FRAMES = 100
 MAX_WORKERS = 4  # concurrent downloads
 

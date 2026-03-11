@@ -1,6 +1,6 @@
 # VideoMaMa Licensing and Acknowledgements
 
-This module (`VideoMaMaInferenceModule`) contains repackaged code and integrations from the **Video Masked Modeling (VideoMaMa)** project developed by the CVLAB at KAIST.
+This module (`alpha_generators/videomama`) contains repackaged code and integrations from the **Video Masked Modeling (VideoMaMa)** project developed by the CVLAB at KAIST.
 
 ## Original Repository
 *   **GitHub:** [https://github.com/cvlab-kaist/VideoMaMa](https://github.com/cvlab-kaist/VideoMaMa)

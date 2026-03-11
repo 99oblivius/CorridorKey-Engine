@@ -38,8 +38,8 @@ Requires [uv](https://docs.astral.sh/uv/) (handles Python, venvs, and packages).
 
 **Windows:**
 1. Clone this repository
-2. Run `Install_CorridorKey_Windows.bat`
-3. *(Optional)* `Install_GVM_Windows.bat` / `Install_VideoMaMa_Windows.bat`
+2. Run `tools/Install_CorridorKey_Windows.bat`
+3. *(Optional)* `tools/Install_GVM_Windows.bat` / `tools/Install_VideoMaMa_Windows.bat`
 
 **Linux / Mac:**
 ```bash
@@ -56,12 +56,12 @@ uv run hf download nikopueringer/CorridorKey_v1.0 --local-dir CorridorKeyModule/
 # BiRefNet -- downloaded automatically via torchhub
 
 # GVM (optional)
-uv run hf download geyongtao/gvm --local-dir gvm_core/weights
+uv run hf download geyongtao/gvm --local-dir alpha_generators/gvm/weights
 
 # VideoMaMa (optional)
-uv run hf download SammyLim/VideoMaMa --local-dir VideoMaMaInferenceModule/checkpoints/VideoMaMa
+uv run hf download SammyLim/VideoMaMa --local-dir alpha_generators/videomama/checkpoints/VideoMaMa
 uv run hf download stabilityai/stable-video-diffusion-img2vid-xt \
-  --local-dir VideoMaMaInferenceModule/checkpoints/stable-video-diffusion-img2vid-xt \
+  --local-dir alpha_generators/videomama/checkpoints/stable-video-diffusion-img2vid-xt \
   --include "feature_extractor/*" "image_encoder/*" "vae/*" "model_index.json"
 ```
 
@@ -71,7 +71,7 @@ uv run hf download stabilityai/stable-video-diffusion-img2vid-xt \
 
 ```bash
 uv run corridorkey wizard "/path/to/footage"
-# Windows: drag folder onto CorridorKey_DRAG_CLIPS_HERE_local.bat
+# Windows: drag folder onto tools/CorridorKey_DRAG_CLIPS_HERE_local.bat
 ```
 
 ### Example

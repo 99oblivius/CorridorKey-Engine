@@ -348,7 +348,7 @@ Alpha hints were auto-generated using HSV chroma keying:
 7. Gaussian blur with 21px kernel (produces soft/coarse edges the model expects)
 8. Save as uint8 PNG
 
-Script: `tears_of_steel_test/generate_alpha_hints.py`
+Script: `tools/benchmarks/generate_alpha_hints.py`
 
 ### Benchmark Script
 
@@ -404,7 +404,7 @@ Output/
 ### Test Data
 
 ```
-tears_of_steel_test/
+benchmark/
   frames/                 # 100 EXR source frames (4096x2160, ~51 MB each)
   alpha_hints/            # 100 PNG alpha hints (4096x2160, auto-generated)
   download_frames.py      # Downloads frames from media.xiph.org
@@ -418,7 +418,7 @@ tears_of_steel_test/
 ### 1. Download test footage
 
 ```bash
-uv run python tears_of_steel_test/download_frames.py
+uv run python tools/benchmarks/download_frames.py
 ```
 
 Downloads the first 100 EXR frames (~5.1 GB) from the Tears of Steel open movie project.
@@ -426,7 +426,7 @@ Downloads the first 100 EXR frames (~5.1 GB) from the Tears of Steel open movie 
 ### 2. Generate alpha hints
 
 ```bash
-uv run python tears_of_steel_test/generate_alpha_hints.py
+uv run python tools/benchmarks/generate_alpha_hints.py
 ```
 
 Generates coarse alpha hints using HSV chroma keying.

@@ -10,7 +10,7 @@ The codebase uses two different methods to convert between linear and sRGB:
    below the breakpoint.
 
 2. **Gamma 2.2 approximation** — used by ``clip_manager.py:383`` (VideoMaMa
-   frame loading) and ``gvm_core/gvm/utils/inference_utils.py:124`` (GVM
+   frame loading) and ``alpha_generators/gvm/gvm/utils/inference_utils.py:124`` (GVM
    frame loading).  This uses a simple ``x ** (1/2.2)`` power curve.
 
 The two methods produce visibly different results, especially in darks.

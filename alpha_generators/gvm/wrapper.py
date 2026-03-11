@@ -17,7 +17,7 @@ from diffusers import AutoencoderKLTemporalDecoder, FlowMatchEulerDiscreteSchedu
 from tqdm import tqdm
 
 # Relative imports from the internal gvm package
-# Assuming this file is inside gvm_core/
+# Assuming this file is inside alpha_generators/gvm/
 from .gvm.pipelines.pipeline_gvm import GVMPipeline
 from .gvm.utils.inference_utils import VideoReader, VideoWriter, ImageSequenceReader, ImageSequenceWriter
 from .gvm.models.unet_spatio_temporal_condition import UNetSpatioTemporalConditionModel

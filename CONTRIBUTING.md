@@ -63,7 +63,7 @@ In your PR description, focus on **why** you made the change, not just what chan
 - The project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting
 - Lint rules: `E, F, W, I, B` (basic style, unused imports, import sorting, common bug patterns)
 - Line length: 120 characters
-- Third-party code in `gvm_core/` and `VideoMaMaInferenceModule/` is excluded from lint enforcement — those are derived from research repos and we try to keep them close to upstream
+- Third-party code in `alpha_generators/gvm/` and `alpha_generators/videomama/` is excluded from lint enforcement — those are derived from research repos and we try to keep them close to upstream
 
 ### Model Weights
 

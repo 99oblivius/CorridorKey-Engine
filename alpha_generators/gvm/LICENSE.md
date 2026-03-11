@@ -1,6 +1,6 @@
 # GVM Licensing and Acknowledgements
 
-This module (`gvm_core`) contains repackaged code and integrations from the **Generative Video Matting (GVM)** project hosted by the Advanced Intelligent Machines (AIM) research team at Zhejiang University (`aim-uofa`).
+This module (`alpha_generators.gvm`) contains repackaged code and integrations from the **Generative Video Matting (GVM)** project hosted by the Advanced Intelligent Machines (AIM) research team at Zhejiang University (`aim-uofa`).
 
 ## Original Repository
 *   **GitHub:** [https://github.com/aim-uofa/GVM](https://github.com/aim-uofa/GVM)

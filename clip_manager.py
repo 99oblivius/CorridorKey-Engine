@@ -21,8 +21,8 @@ from device_utils import resolve_device
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from birefnet_core import BiRefNetProcessor
-    from gvm_core import GVMProcessor
+    from alpha_generators.birefnet import BiRefNetProcessor
+    from alpha_generators.gvm import GVMProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ class ClipEntry:
                         )
                         self.alpha_asset = None
         else:
-            # Check for video file (Case-Insensitive)
+            # Check for standalone video file (Case-Insensitive)
             # Match AlphaHint.* or alphahint.*
             candidates = glob.glob(os.path.join(self.root_path, "[Aa]lpha[Hh]int.*"))
             candidates = [c for c in candidates if is_video_file(c)]
@@ -189,12 +189,12 @@ class ClipEntry:
 
 def get_gvm_processor(device: str = "cpu") -> GVMProcessor:
     try:
-        from gvm_core import GVMProcessor
+        from alpha_generators.gvm import GVMProcessor
 
         return GVMProcessor(device=device)
     except ImportError:
         raise ImportError(
-            "Could not import gvm_core. Please ensure 'gvm_core' is in the project root and requirements are installed."
+            "Could not import alpha_generators.gvm. Please ensure 'alpha_generators/gvm' is in the project root and requirements are installed."
         ) from None
     except Exception as e:
         raise RuntimeError(f"Failed to initialize GVM Processor: {e}") from e
@@ -287,12 +287,12 @@ def generate_alphas(
 
 def get_birefnet_processor(device: str = "cpu") -> BiRefNetProcessor:
     try:
-        from birefnet_core import BiRefNetProcessor
+        from alpha_generators.birefnet import BiRefNetProcessor
 
         return BiRefNetProcessor(device=device)
     except ImportError:
         raise ImportError(
-            "Could not import birefnet_core. Please ensure 'birefnet_core' is in the project root"
+            "Could not import alpha_generators.birefnet. Please ensure 'alpha_generators/birefnet' is in the project root"
             " and requirements are installed."
         ) from None
     except Exception as e:
@@ -417,12 +417,12 @@ def run_videomama(
 
     logger.info(f"Found {len(clips_to_process)} clips for VideoMaMa processing.")
 
-    # Import locally — sys.path mutation is needed because VideoMaMaInferenceModule
+    # Import locally — sys.path mutation is needed because alpha_generators.videomama
     # uses intra-package imports that assume its directory is on the path.
     try:
-        sys.path.append(os.path.join(BASE_DIR, "VideoMaMaInferenceModule"))
-        from VideoMaMaInferenceModule.inference import load_videomama_model
-        from VideoMaMaInferenceModule.inference import run_inference as run_videomama_frames
+        sys.path.append(os.path.join(BASE_DIR, "alpha_generators", "videomama"))
+        from alpha_generators.videomama.inference import load_videomama_model
+        from alpha_generators.videomama.inference import run_inference as run_videomama_frames
     except ImportError as e:
         logger.error(f"Failed to import VideoMaMa: {e}")
         return

@@ -58,6 +58,6 @@ if not exist "CorridorKeyModule\checkpoints\CorridorKey.pth" (
 echo.
 echo ===================================================
 echo   Setup Complete! You are ready to key!
-echo   Drag and drop folders onto CorridorKey_DRAG_CLIPS_HERE_local.bat
+echo   Drag and drop folders onto tools\CorridorKey_DRAG_CLIPS_HERE_local.bat
 echo ===================================================
 pause

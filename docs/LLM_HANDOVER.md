@@ -44,7 +44,7 @@ The biggest challenge in this codebase revolves around **Color Space** and **Gam
 
 ## 3. The Inference Pipeline (`clip_manager.py`)
 
-Users generally run the system via local shell launcher scripts (`CorridorKey_DRAG_CLIPS_HERE_local.bat` or `.sh`) which boot the `clip_manager.py` wizard. 
+Users generally run the system via local shell launcher scripts (`tools/CorridorKey_DRAG_CLIPS_HERE_local.bat` or `tools/CorridorKey_DRAG_CLIPS_HERE_local.sh`) which boot the `clip_manager.py` wizard.
 
 The pipeline works as follows:
 1.  **Scan:** Looks for folders (or dragged-and-dropped paths) containing an `Input` sequence (RGB) and an `AlphaHint` sequence (BW).

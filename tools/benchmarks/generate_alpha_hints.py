@@ -7,7 +7,7 @@ The EXR frames are in linear color space, so we convert to sRGB before HSV
 analysis for more perceptually accurate green detection.
 
 Usage:
-    uv run python tears_of_steel_test/generate_alpha_hints.py
+    uv run python tools/benchmarks/generate_alpha_hints.py
 """
 
 import glob
@@ -20,8 +20,9 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
 import numpy as np
 
-FRAMES_DIR = os.path.join(os.path.dirname(__file__), "frames")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "alpha_hints")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+FRAMES_DIR = os.path.join(_PROJECT_ROOT, "benchmark", "frames")
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "benchmark", "alpha_hints")
 
 # HSV thresholds for green screen detection (in sRGB/HSV space)
 # Hue: 35-85 covers green range (OpenCV uses 0-180 scale)

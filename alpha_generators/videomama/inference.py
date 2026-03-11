@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Add current directory to path so that pipeline.py's intra-package imports
 # (e.g. "from pipeline import ...") resolve when this module is imported from
-# outside the VideoMaMaInferenceModule directory.  This is a workaround for the
+# outside the alpha_generators/videomama directory.  This is a workaround for the
 # module's original structure — a cleaner fix would convert to proper relative
 # imports throughout.
 current_dir = os.path.dirname(os.path.abspath(__file__))

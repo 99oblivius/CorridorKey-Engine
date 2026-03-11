@@ -10,7 +10,7 @@ if [ -z "$1" ]; then
     echo ""
     echo "USAGE:"
     echo "You can either run this script from the terminal and provide a path:"
-    echo "  ./CorridorKey_DRAG_CLIPS_HERE_local.sh /path/to/your/clip/folder"
+    echo "  ./tools/CorridorKey_DRAG_CLIPS_HERE_local.sh /path/to/your/clip/folder"
     echo ""
     echo "Or, in many Linux/macOS desktop environments, you can simply"
     echo "DRAG AND DROP a folder onto this script icon to process it."

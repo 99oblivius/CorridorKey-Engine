@@ -309,7 +309,7 @@ class CorridorKeyService:
         if self._gvm_processor is not None:
             return self._gvm_processor
 
-        from gvm_core import GVMProcessor
+        from alpha_generators.gvm import GVMProcessor
 
         logger.info("Loading GVM processor...")
         t0 = time.monotonic()
@@ -324,8 +324,8 @@ class CorridorKeyService:
         if self._videomama_pipeline is not None:
             return self._videomama_pipeline
 
-        sys.path.insert(0, os.path.join(BASE_DIR, "VideoMaMaInferenceModule"))
-        from VideoMaMaInferenceModule.inference import load_videomama_model
+        sys.path.insert(0, os.path.join(BASE_DIR, "alpha_generators", "videomama"))
+        from alpha_generators.videomama.inference import load_videomama_model
 
         logger.info("Loading VideoMaMa pipeline...")
         t0 = time.monotonic()
@@ -982,8 +982,8 @@ class CorridorKeyService:
             )
 
         # ── Phase 4: Inference (per-chunk) ──
-        sys.path.insert(0, os.path.join(BASE_DIR, "VideoMaMaInferenceModule"))
-        from VideoMaMaInferenceModule.inference import run_inference
+        sys.path.insert(0, os.path.join(BASE_DIR, "alpha_generators", "videomama"))
+        from alpha_generators.videomama.inference import run_inference
 
         total_chunks = (num_frames + chunk_size - 1) // chunk_size
         _status(f"Running inference (chunk 1/{total_chunks})...")

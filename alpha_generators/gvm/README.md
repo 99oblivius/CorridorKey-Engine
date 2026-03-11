@@ -6,7 +6,7 @@ It is designed to be a self-contained, portable module that can be dropped into 
 ## Directory Structure
 
 ```
-gvm_core/
+alpha_generators/gvm/
 ├── __init__.py           # Exports the main GVMProcessor class
 ├── wrapper.py            # High-level API for inference
 ├── requirements.txt      # List of dependencies
@@ -37,7 +37,7 @@ The processor automatically finds the bundled model weights in the `weights/` di
 ### Basic Example
 
 ```python
-from gvm_core import GVMProcessor
+from alpha_generators.gvm import GVMProcessor
 
 # Initialize the processor
 # It will load models from ./weights automatically
@@ -70,4 +70,4 @@ processor.process_sequence(
 ## Troubleshooting
 
 - **Out of Memory (OOM)**: Reduce `num_frames_per_batch` (e.g., to 4 or 2) and `decode_chunk_size`.
-- **Missing Weights**: Ensure the `weights/` folder exists inside `gvm_core/`. If you moved the code without the weights, you must download them or copy them separately.
+- **Missing Weights**: Ensure the `weights/` folder exists inside `alpha_generators/gvm/`. If you moved the code without the weights, you must download them or copy them separately.
