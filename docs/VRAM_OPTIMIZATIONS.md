@@ -251,7 +251,7 @@ Output: alpha, FG (sRGB), processed (linear premul RGBA), comp (sRGB preview)
 
 ### Auto-Backend Selection
 
-In `CorridorKeyModule/backend.py`, the system auto-detects the optimal engine:
+In `CorridorKeyModule/engine_factory.py`, the system auto-detects the optimal engine:
 
 - CUDA GPU with less than 16 GB VRAM: Uses `OptimizedCorridorKeyEngine` with `OptimizationConfig.optimized()`
 - CUDA GPU with 16 GB or more VRAM: Uses standard `CorridorKeyEngine` (no optimizations needed)
@@ -450,6 +450,6 @@ Processes all 100 frames through both configurations, generates the report at `b
 | `CorridorKeyModule/optimized_engine.py` | `OptimizedCorridorKeyEngine` with LTRM weight handling |
 | `CorridorKeyModule/core/optimized_model.py` | FlashAttention patch, TiledCNNRefiner, LTRM, ECA, TokenRouter |
 | `CorridorKeyModule/core/model_transformer.py` | `GreenFormer` model (applies FA, tiling, cache clearing) |
-| `CorridorKeyModule/backend.py` | Auto-backend selection based on GPU VRAM |
+| `CorridorKeyModule/engine_factory.py` | Auto-backend selection based on GPU VRAM |
 | `benchmark_4k_vram.py` | 4K benchmark script |
 | `benchmark_4k_results.md` | Latest benchmark results |
