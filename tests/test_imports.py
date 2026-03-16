@@ -22,19 +22,19 @@ def test_import_model_transformer():
 
 
 def test_import_gvm_core():
-    import alpha_generators.gvm  # noqa: F401
+    import ck_engine.generators.gvm  # noqa: F401
 
 
 def test_import_gvm_wrapper():
-    from alpha_generators.gvm import wrapper  # noqa: F401
+    from ck_engine.generators.gvm import wrapper  # noqa: F401
 
 
 def test_import_videomama():
-    import alpha_generators.videomama  # noqa: F401
+    import ck_engine.generators.videomama  # noqa: F401
 
 
 def test_import_videomama_inference():
-    from alpha_generators.videomama import inference  # noqa: F401
+    from ck_engine.generators.videomama import inference  # noqa: F401
 
 
 def test_import_optimization_config():

@@ -23,6 +23,7 @@ from CorridorKeyModule.core.optimized_model import (
     HintBasedTokenRouter,
     TiledCNNRefiner,
 )
+from ck_engine.config import IMAGENET_MEAN, IMAGENET_STD
 
 # ---------------------------------------------------------------------------
 # ECA
@@ -303,10 +304,10 @@ class TestOptimizedEngineAPI:
         engine.checkpoint_path = "/fake/checkpoint.pth"
         engine.use_refiner = False
         engine.config = OptimizationConfig.optimized()
-        engine.mean_np = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        engine.std_np = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
-        engine._mean_t = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        engine._std_t = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        engine.mean_np = np.array(list(IMAGENET_MEAN), dtype=np.float32).reshape(1, 1, 3)
+        engine.std_np = np.array(list(IMAGENET_STD), dtype=np.float32).reshape(1, 1, 3)
+        engine._mean_t = torch.tensor(list(IMAGENET_MEAN)).view(1, 3, 1, 1)
+        engine._std_t = torch.tensor(list(IMAGENET_STD)).view(1, 3, 1, 1)
         engine._checker_cache = {}
         engine._checker_cache_cpu = {}
         engine._refiner_scale = 1.0
@@ -364,12 +365,12 @@ class TestOptimizedEngineAPI:
 
 class TestBackendFactory:
     def test_torch_optimized_is_valid_backend(self):
-        from CorridorKeyModule.backend import VALID_BACKENDS
+        from CorridorKeyModule.engine_factory import VALID_BACKENDS
 
         assert "torch_optimized" in VALID_BACKENDS
 
     def test_resolve_backend_explicit(self):
-        from CorridorKeyModule.backend import resolve_backend
+        from CorridorKeyModule.engine_factory import resolve_backend
 
         assert resolve_backend("torch") == "torch"
         assert resolve_backend("torch_optimized") == "torch_optimized"

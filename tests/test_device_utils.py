@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from device_utils import (
+from ck_engine.device import (
     DEVICE_ENV_VAR,
     clear_device_cache,
     detect_best_device,
@@ -119,7 +119,7 @@ class TestResolveDevice:
         _patch_gpu(monkeypatch, cuda=False, mps=False)
         # Replace torch.backends with an object that lacks "mps" entirely
         fake_backends = type("Backends", (), {})()
-        monkeypatch.setattr("device_utils.torch.backends", fake_backends)
+        monkeypatch.setattr("ck_engine.device.torch.backends", fake_backends)
         with pytest.raises(RuntimeError, match="no MPS support"):
             resolve_device("mps")
 

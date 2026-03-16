@@ -8,15 +8,12 @@ import numpy as np
 import pytest
 import torch
 
+from ck_engine.config import Dir
+
 
 def _has_gpu():
     """Check if any GPU backend (CUDA or MPS) is available."""
-    if torch.cuda.is_available():
-        return True
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return True
-
-    return False
+    return torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
 
 
 def _has_mlx():
@@ -104,19 +101,19 @@ def tmp_clip_dir(tmp_path):
 
     # shot_a — fully ready (Input + AlphaHint populated)
     shot_a = tmp_path / "shot_a"
-    for subdir in ["Input", "AlphaHint", "VideoMamaMaskHint"]:
+    for subdir in [Dir.INPUT, Dir.ALPHA_HINT, Dir.VIDEOMAMA_HINT]:
         (shot_a / subdir).mkdir(parents=True)
 
     for i in range(2):
-        cv2.imwrite(str(shot_a / "Input" / f"frame_{i:04d}.png"), tiny_img)
-        cv2.imwrite(str(shot_a / "AlphaHint" / f"frame_{i:04d}.png"), tiny_mask)
+        cv2.imwrite(str(shot_a / Dir.INPUT / f"frame_{i:04d}.png"), tiny_img)
+        cv2.imwrite(str(shot_a / Dir.ALPHA_HINT / f"frame_{i:04d}.png"), tiny_mask)
 
     # shot_b — Input only, empty AlphaHint (needs generation)
     shot_b = tmp_path / "shot_b"
-    for subdir in ["Input", "AlphaHint", "VideoMamaMaskHint"]:
+    for subdir in [Dir.INPUT, Dir.ALPHA_HINT, Dir.VIDEOMAMA_HINT]:
         (shot_b / subdir).mkdir(parents=True)
 
-    cv2.imwrite(str(shot_b / "Input" / "frame_0000.png"), tiny_img)
+    cv2.imwrite(str(shot_b / Dir.INPUT / "frame_0000.png"), tiny_img)
 
     return tmp_path
 

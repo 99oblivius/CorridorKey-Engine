@@ -9,7 +9,7 @@ pytestmark = [pytest.mark.mlx, pytest.mark.slow]
 @pytest.fixture
 def mlx_engine():
     """Load MLX engine via create_engine at 2048."""
-    from CorridorKeyModule.backend import create_engine
+    from CorridorKeyModule.engine_factory import create_engine
 
     return create_engine(backend="mlx", img_size=2048)
 

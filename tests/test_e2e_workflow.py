@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from CorridorKeyModule.base_engine import PendingTransfer
+from ck_engine.config import Dir
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,7 +71,8 @@ class TestE2EInferenceWorkflow:
 
     def test_output_directories_created(self, tmp_clip_dir, monkeypatch):
         """run_inference creates Output/{FG,Matte,Comp,Processed} for each clip."""
-        from clip_manager import ClipEntry, run_inference
+        from ck_engine.clip_state import ClipEntry
+        from ck_engine.pipeline import run_inference
 
         entry = ClipEntry("shot_a", str(tmp_clip_dir / "shot_a"))
         entry.find_assets()
@@ -79,14 +81,14 @@ class TestE2EInferenceWorkflow:
 
         mock_engine = _make_mock_engine()
 
-        with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
+        with patch("CorridorKeyModule.engine_factory.create_engine", return_value=mock_engine):
             run_inference([entry], device="cpu")
 
-        out_root = tmp_clip_dir / "shot_a" / "Output"
-        assert (out_root / "FG").is_dir()
-        assert (out_root / "Matte").is_dir()
-        assert (out_root / "Comp").is_dir()
-        assert (out_root / "Processed").is_dir()
+        out_root = tmp_clip_dir / "shot_a" / Dir.OUTPUT
+        assert (out_root / Dir.FG).is_dir()
+        assert (out_root / Dir.MATTE).is_dir()
+        assert (out_root / Dir.COMP).is_dir()
+        assert (out_root / Dir.PROCESSED).is_dir()
 
     def test_output_files_written_per_frame(self, tmp_clip_dir, monkeypatch):
         """run_inference writes exactly one output file per input frame.
@@ -94,7 +96,8 @@ class TestE2EInferenceWorkflow:
         shot_a has 2 input frames and 2 alpha frames, so each output
         subdirectory should contain exactly 2 files after inference.
         """
-        from clip_manager import ClipEntry, run_inference
+        from ck_engine.clip_state import ClipEntry
+        from ck_engine.pipeline import run_inference
 
         entry = ClipEntry("shot_a", str(tmp_clip_dir / "shot_a"))
         entry.find_assets()
@@ -103,15 +106,15 @@ class TestE2EInferenceWorkflow:
 
         mock_engine = _make_mock_engine()
 
-        with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
+        with patch("CorridorKeyModule.engine_factory.create_engine", return_value=mock_engine):
             run_inference([entry], device="cpu")
 
-        out_root = tmp_clip_dir / "shot_a" / "Output"
+        out_root = tmp_clip_dir / "shot_a" / Dir.OUTPUT
         # shot_a has 2 frames → 2 files per output directory
-        assert len(list((out_root / "FG").glob("*.exr"))) == 2
-        assert len(list((out_root / "Matte").glob("*.exr"))) == 2
-        assert len(list((out_root / "Comp").glob("*.png"))) == 2
-        assert len(list((out_root / "Processed").glob("*.exr"))) == 2
+        assert len(list((out_root / Dir.FG).glob("*.exr"))) == 2
+        assert len(list((out_root / Dir.MATTE).glob("*.exr"))) == 2
+        assert len(list((out_root / Dir.COMP).glob("*.exr"))) == 2
+        assert len(list((out_root / Dir.PROCESSED).glob("*.exr"))) == 2
 
     def test_clip_without_alpha_skipped(self, tmp_clip_dir, monkeypatch):
         """Clips missing an alpha asset are silently skipped by run_inference.
@@ -119,7 +122,8 @@ class TestE2EInferenceWorkflow:
         shot_b has Input but an empty AlphaHint, so it has no alpha_asset.
         run_inference should process zero frames and create no Output directory.
         """
-        from clip_manager import ClipEntry, run_inference
+        from ck_engine.clip_state import ClipEntry
+        from ck_engine.pipeline import run_inference
 
         entry = ClipEntry("shot_b", str(tmp_clip_dir / "shot_b"))
         entry.find_assets()
@@ -129,9 +133,9 @@ class TestE2EInferenceWorkflow:
 
         mock_engine = _make_mock_engine()
 
-        with patch("CorridorKeyModule.backend.create_engine", return_value=mock_engine):
+        with patch("CorridorKeyModule.engine_factory.create_engine", return_value=mock_engine):
             run_inference([entry], device="cpu")
 
         # No engine calls — clip was filtered out before inference
         mock_engine.process_raw_deferred.assert_not_called()
-        assert not (tmp_clip_dir / "shot_b" / "Output").exists()
+        assert not (tmp_clip_dir / "shot_b" / Dir.OUTPUT).exists()
