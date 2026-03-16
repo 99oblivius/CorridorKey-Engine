@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, ClassVar
 from textual import on
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, RichLog, Static
+from textual.widgets import Button, Input, RichLog, Static
 
 from ..client import (
     EngineClipStarted,
@@ -106,7 +106,6 @@ class InferencePanel(Vertical, can_focus=True):
         height: 1;
         padding: 0 1;
         background: $surface;
-        color: $text-muted;
     }
 
     InferencePanel #inf-progress {
@@ -136,6 +135,7 @@ class InferencePanel(Vertical, can_focus=True):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "start_inference", "Start", priority=True),
         Binding("escape", "cancel_inference", "Cancel", priority=True),
+        Binding("e", "edit_settings", "Edit Settings", priority=True),
     ]
 
     def __init__(self, **kwargs: object) -> None:
@@ -147,24 +147,50 @@ class InferencePanel(Vertical, can_focus=True):
     def compose(self) -> ComposeResult:
         yield RichLog(highlight=True, markup=True, id="inf-log")
         with Vertical(id="inf-bottom"):
-            yield self._build_settings_bar()
+            yield Static("", id="inf-settings-bar")
             yield ProgressPanel(id="inf-progress")
             yield Static("", id="inf-status")
             with Horizontal(id="inf-button-bar"):
                 yield Button("Start", variant="primary", id="inf-start-btn")
                 yield Button("Cancel", variant="default", id="inf-cancel-btn")
 
-    def _build_settings_bar(self) -> Static:
-        """Build the settings summary bar from current project settings."""
-        settings = self._load_settings()
-        cs = "Linear" if settings.input_is_linear else "sRGB"
-        despill = int(settings.despill_strength * 10)
-        despeckle = f"ON ({settings.despeckle_size})" if settings.auto_despeckle else "OFF"
-        text = f"Settings: {cs} | despill {despill} | despeckle {despeckle} | refiner {settings.refiner_scale}"
-        return Static(text, id="inf-settings-bar")
-
     def on_mount(self) -> None:
         self.query_one("#inf-log", RichLog).can_focus = False
+        self._update_settings_bar()
+
+    # ------------------------------------------------------------------
+    # Settings bar — single-line display, editable via key bindings
+    # ------------------------------------------------------------------
+
+    def _update_settings_bar(self) -> None:
+        """Render the settings bar from current loaded settings."""
+        s = self._load_settings()
+        cs = "Linear" if s.input_is_linear else "sRGB"
+        despill = int(s.despill_strength * 10)
+        despeckle = f"ON ({s.despeckle_size})" if s.auto_despeckle else "OFF"
+        text = (
+            f"[bold]Settings:[/]  {cs}  |  "
+            f"despill {despill}  |  "
+            f"despeckle {despeckle}  |  "
+            f"refiner {s.refiner_scale}"
+            f"  [dim](press [bold]e[/bold] to edit)[/]"
+        )
+        self.query_one("#inf-settings-bar", Static).update(text)
+
+    def action_edit_settings(self) -> None:
+        """Open an inline editor for inference settings."""
+        from tui.screens.inference_settings_editor import InferenceSettingsEditor
+
+        s = self._load_settings()
+        self.app.push_screen(
+            InferenceSettingsEditor(s, self._get_project_path()),
+            callback=self._on_settings_edited,
+        )
+
+    def _on_settings_edited(self, result: object) -> None:
+        """Called when the settings editor closes."""
+        if result:
+            self._update_settings_bar()
 
     # ------------------------------------------------------------------
     # Engine event handlers
@@ -268,13 +294,13 @@ class InferencePanel(Vertical, can_focus=True):
         from ck_engine.api.types import InferenceSettings as APISetts
         from ck_engine.api.types import OptimizationParams
 
-        pipeline_settings = self._load_settings()
+        s = self._load_settings()
         settings = APISetts(
-            input_is_linear=pipeline_settings.input_is_linear,
-            despill_strength=pipeline_settings.despill_strength,
-            auto_despeckle=pipeline_settings.auto_despeckle,
-            despeckle_size=pipeline_settings.despeckle_size,
-            refiner_scale=pipeline_settings.refiner_scale,
+            input_is_linear=s.input_is_linear,
+            despill_strength=s.despill_strength,
+            auto_despeckle=s.auto_despeckle,
+            despeckle_size=s.despeckle_size,
+            refiner_scale=s.refiner_scale,
         )
 
         # Build optimization from global settings
@@ -350,6 +376,10 @@ class InferencePanel(Vertical, can_focus=True):
             dma_buffers=gs.dma_buffers,
         )
 
+    def refresh_settings(self) -> None:
+        """Reload settings bar from the project directory."""
+        self._update_settings_bar()
+
     def _load_settings(self) -> APISettings:
         """Load inference settings from project settings or defaults."""
         from ck_engine.api.types import InferenceSettings as APISetts
@@ -385,6 +415,7 @@ class InferencePanel(Vertical, can_focus=True):
 
     def check_readiness(self) -> None:
         """Disable Start button and show status when no clips are ready."""
+        self.refresh_settings()
         path = self._get_project_path()
         start_btn = self.query_one("#inf-start-btn", Button)
         if not path:
