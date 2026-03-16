@@ -12,8 +12,8 @@ Thanks for your interest in improving CorridorKey! Whether you're a VFX artist, 
 ### Dev Setup
 
 ```bash
-git clone https://github.com/nikopueringer/CorridorKey.git
-cd CorridorKey
+git clone https://github.com/99oblivius/CorridorKey-Engine.git
+cd CorridorKey-Engine
 uv sync --group dev    # installs all dependencies + dev tools (pytest, ruff)
 ```
 
@@ -54,16 +54,16 @@ In your PR description, focus on **why** you made the change, not just what chan
 ### What Makes a Good Contribution
 
 - **Bug fixes** — especially for edge cases in EXR/linear workflows, color space handling, or platform-specific issues
-- **Tests** — more test coverage is always welcome, particularly for `clip_manager.py` and `inference_engine.py`
+- **Tests** — more test coverage is always welcome, particularly for `ck_engine/pipeline/` (inference orchestration) and `CorridorKeyModule/inference_engine.py` (core model inference)
 - **Documentation** — better explanations, usage examples, or clarifying comments in tricky code
 - **Performance** — reducing GPU memory usage, speeding up frame processing, or optimizing I/O
 
 ### Code Style
 
 - The project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting
-- Lint rules: `E, F, W, I, B` (basic style, unused imports, import sorting, common bug patterns)
+- Lint rules: `E, F, W, I, B, UP, ANN, RUF, SIM, TCH, PIE, RET, C4, PT, PYI, T20` (see `pyproject.toml` for details)
 - Line length: 120 characters
-- Third-party code in `alpha_generators/gvm/` and `alpha_generators/videomama/` is excluded from lint enforcement — those are derived from research repos and we try to keep them close to upstream
+- Third-party code in `ck_engine/generators/gvm/` and `ck_engine/generators/videomama/` is excluded from lint enforcement — those are derived from research repos and we try to keep them close to upstream
 
 ### Model Weights
 

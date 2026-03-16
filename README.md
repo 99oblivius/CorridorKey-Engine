@@ -1,183 +1,134 @@
-# CorridorKey
+# CorridorKey Engine
 
 Neural network green screen keying for professional VFX pipelines.
-Fork of [nikopueringer/CorridorKey](https://github.com/nikopueringer/CorridorKey) by Corridor Digital.
+Fork of [nikopueringer/CorridorKey](https://github.com/nikopueringer/CorridorKey) with async multi-GPU inference, optimization profiles, a JSON-RPC engine API, and a Textual TUI.
 
-## Features
+---
 
-- Physically accurate unmixing of straight-color foreground and linear alpha (32-bit EXR)
-- Resolution independent inference (2048x2048 backbone, scales to 4K+)
-- Async multi-GPU pipeline with deferred DMA transfers and pipelined reader/writer thread pools
-- GPU and CPU postprocessing paths (toggle with `--gpu-postprocess` / `--cpu-postprocess`)
-- Transparent RGBA or checkerboard composite output
-- Morphological despeckle (tracking marker removal)
-- Rich terminal wizard with real-time progress and IO throughput
-- Alpha hint generators: BiRefNet (~4 GB), GVM (~80 GB), VideoMaMa (~80 GB)
+## Install
 
-## Hardware
+Requires [uv](https://docs.astral.sh/uv/).
 
-**This software saturates your CPU & GPU at 100% utilization. Ensure adequate cooling.**
-
-| Component | VRAM |
-|---|---|
-| CorridorKey (optimized profile) | <8 GB |
-| CorridorKey (original, unoptimized) | ~22.7 GB |
-| + GPU postprocessing | +~1.5 GB |
-| + cuDNN auto-tune (`--cudnn-benchmark`) | +2-5 GB |
-| BiRefNet alpha hints | ~4 GB |
-| GVM / VideoMaMa alpha hints | ~80 GB |
-
-12 GB GPU recommended. The 2048 profile compilation and 4K inference fits in 8-12 GB. 1024 img_size fits in 2-3 GB.
-Running on a GPU that is not driving your display avoids OOM from compositor overhead.
-
-**Windows:** NVIDIA drivers must support CUDA 12.8+.
-
-## Installation
-
-Requires [uv](https://docs.astral.sh/uv/) (handles Python, venvs, and packages).
-
-**Windows:**
-1. Clone this repository
-2. Run `tools/Install_CorridorKey_Windows.bat`
-3. *(Optional)* `tools/Install_GVM_Windows.bat` / `tools/Install_VideoMaMa_Windows.bat`
-
-**Linux / Mac:**
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/nikopueringer/CorridorKey.git && cd CorridorKey
+git clone https://github.com/99oblivius/CorridorKey-Engine.git && cd CorridorKey-Engine
 uv sync
 ```
 
-**Models:**
+Windows: run `tools/Install_CorridorKey_Windows.bat` instead.
+
+## Models
+
 ```bash
 # CorridorKey (required, ~300 MB)
 uv run hf download nikopueringer/CorridorKey_v1.0 --local-dir CorridorKeyModule/checkpoints
 
-# BiRefNet -- downloaded automatically via torchhub
+# BiRefNet — downloaded automatically via torchhub
 
-# GVM (optional)
-uv run hf download geyongtao/gvm --local-dir alpha_generators/gvm/weights
+# GVM (optional, ~80 GB VRAM)
+uv run hf download geyongtao/gvm --local-dir ck_engine/generators/gvm/weights
 
-# VideoMaMa (optional)
-uv run hf download SammyLim/VideoMaMa --local-dir alpha_generators/videomama/checkpoints/VideoMaMa
+# VideoMaMa (optional, ~80 GB VRAM)
+uv run hf download SammyLim/VideoMaMa --local-dir ck_engine/generators/videomama/checkpoints/VideoMaMa
 uv run hf download stabilityai/stable-video-diffusion-img2vid-xt \
-  --local-dir alpha_generators/videomama/checkpoints/stable-video-diffusion-img2vid-xt \
+  --local-dir ck_engine/generators/videomama/checkpoints/stable-video-diffusion-img2vid-xt \
   --include "feature_extractor/*" "image_encoder/*" "vae/*" "model_index.json"
 ```
 
-## Usage
-
-### Wizard
+## Quick Start
 
 ```bash
-uv run corridorkey wizard "/path/to/footage"
-# Windows: drag folder onto tools/CorridorKey_DRAG_CLIPS_HERE_local.bat
+# TUI (default)
+corridorkey-engine
+corridorkey-engine /path/to/clips
+
+# Headless CLI
+corridorkey-engine inference /path/to/clips --srgb --despill 5 --despeckle --refiner 1.0
+corridorkey-engine generate-alphas /path/to/clips --model birefnet
+
+# Engine server (for integrations)
+corridorkey-engine serve                     # stdio
+corridorkey-engine serve --listen :9400      # TCP daemon
 ```
 
-### Example
+### Engine API
 
-Recommendations:
-- 1024 for FullHD
-- 2048 for 4K footage
-- --cpu-postprocess mostly only makes sense for under FullHD resolutions with a slower GPU
-- --dma-buffers defaults to 2 but for a small cost in additional video memory can perform faster if the GPU is not bottlenecked
+CorridorKey runs as a standalone process speaking JSON-RPC 2.0. Any language
+can connect — spawn as a subprocess (stdio) or connect to a daemon (TCP).
 
-```bash
-uv run corridorkey wizard "/path/to/footage" --img-size 1024 --cudnn-benchmark --gpu-postprocess --dma-buffers 3 --no-comp-png --precision fp16
+```python
+from ck_engine.client import EngineClient
+from ck_engine.api.types import InferenceParams, InferenceSettings
+
+with EngineClient.spawn() as engine:
+    job_id = engine.submit_inference(InferenceParams(
+        path="/path/to/clips",
+        settings=InferenceSettings(despill_strength=0.5),
+    ))
+    for event in engine.iter_events():
+        print(event)
+        if type(event).__name__ in ("JobCompleted", "JobFailed"):
+            break
 ```
 
-### Subcommands
+See [Engine Protocol Reference](docs/engine_protocol.md) for the full spec,
+and [examples/](docs/examples/) for complete stdio and TCP client scripts.
 
-```bash
-uv run corridorkey list-clips
-uv run corridorkey generate-alphas              # GVM
-uv run corridorkey generate-alphas-birefnet     # BiRefNet (~4 GB)
-uv run corridorkey run-inference                # prompts for settings
-```
-
-### Batch (non-interactive)
-
-```bash
-uv run corridorkey run-inference \
-  --srgb --despill 5 --despeckle --refiner 1.0 \
-  --profile optimized --max-frames 100
-```
-
-### Multi-GPU
-
-```bash
-uv run corridorkey run-inference --devices 0,1
-```
-
-Each GPU loads its own model copy. VRAM per GPU is unchanged; throughput scales linearly.
-
-### Outputs
+## Outputs
 
 | Folder | Format | Contents |
 |---|---|---|
 | `Matte/` | EXR | Linear alpha |
-| `FG/` | EXR | Straight foreground (sRGB gamut -- convert to linear for compositing) |
-| `Processed/` | EXR | Premultiplied linear RGBA (drop into Premiere/Resolve) |
-| `Comp/` | PNG | Composite preview (transparent RGBA or checkerboard) |
+| `FG/` | EXR | Straight foreground (sRGB gamut) |
+| `Processed/` | EXR | Premultiplied linear RGBA |
+| `Comp/` | EXR/PNG | Composite preview (transparent RGBA or checkerboard) |
 
-## Performance Tuning
+## VRAM at a Glance
 
-### Profiles
+| Profile | Precision | VRAM | Warmup | Key features |
+|---|---|---|---|---|
+| `optimized` (default) | fp16 | ~2-3 GB | ~10-15s | Flash attention, tiled refiner, cache clearing |
+| `original` | fp32 | ~9-10 GB | ~5s | No tiling, no cache clearing |
+| `performance` | fp16 | ~8-12 GB | ~5-10 min | Full refiner, cuDNN benchmark, max-autotune |
 
-| Profile | VRAM | Notes |
-|---|---|---|
-| `original` | ~22.7 GB | No optimizations |
-| `optimized` | ~8 GB | FlashAttention + tiled refiner + cache clearing (default on CUDA) |
-| `experimental` | ~8 GB | Adds `torch.compile` `reduce-overhead` |
-| `performance` | ~8 GB | `max-autotune` compilation, longer warmup |
+Warmup is first-frame compilation time. Cached after the first run (`~/.cache/torch/inductor/`).
 
-### Flags
-
-| Flag | Effect |
+| Add-on | VRAM |
 |---|---|
-| `--gpu-postprocess` / `--cpu-postprocess` | GPU: faster, +~1.5 GB VRAM |
-| `--cudnn-benchmark` | cuDNN kernel auto-tune. +2-5 GB VRAM, faster convolutions after warmup |
-| `--no-comp-png` | Skip composite PNG output (saves write IO) |
-| `--checkerboard` | Opaque checkerboard comp instead of transparent RGBA |
-| `--compile-mode MODE` | `default`, `reduce-overhead`, `max-autotune`. (WIP) Longer first-frame warmup |
-| `--dma-buffers N` | Pinned DMA buffers for GPU->CPU transfer (2-3). ~87 MB page-locked RAM each at 1080p |
-| `--token-routing` | Experimental sparse attention. Can improve speed at 4K+ |
-| `--precision PREC` | `fp16` (default), `bf16`, `fp32` |
+| + GPU postprocessing | +~1.5 GB |
+| + cuDNN auto-tune | +2-5 GB |
+| BiRefNet alpha hints | ~4 GB |
+| GVM / VideoMaMa alpha hints | ~80 GB |
 
-The pipeline prints a postprocessing hint after each run if it detects you would benefit from switching between GPU and CPU mode.
+8 GB GPU sufficient for default profile. See [VRAM & Optimization Guide](docs/VRAM_OPTIMIZATIONS.md) for benchmarks and tuning.
 
-### Device and backend
+## Documentation
 
-**Device:** `--device` flag > `CORRIDORKEY_DEVICE` env var > auto (CUDA > MPS > CPU)
-
-**Backend:** `--backend` flag > `CORRIDORKEY_BACKEND` env var > auto (MLX on Apple Silicon, Torch elsewhere)
-
-MLX setup:
-```bash
-uv pip install corridorkey-mlx@git+https://github.com/nikopueringer/corridorkey-mlx.git
-# Place weights at CorridorKeyModule/checkpoints/corridorkey_mlx.safetensors
-```
-
-Mac MPS is experimental. Set `PYTORCH_ENABLE_MPS_FALLBACK=1` for unsupported ops.
+| Doc | Audience |
+|---|---|
+| [CLI Reference](docs/cli_reference.md) | All flags, commands, profiles, multi-GPU, MLX |
+| [Engine Protocol](docs/engine_protocol.md) | JSON-RPC spec for plugin/integration developers |
+| [Architecture](docs/architecture.md) | Package structure, model hierarchy, pipeline design |
+| [VRAM & Optimization](docs/VRAM_OPTIMIZATIONS.md) | Benchmarks, optimization profiles, VRAM breakdown |
+| [Async Pipeline](docs/async_pipeline_flowchart.md) | Threading model, DMA pipeline, GIL analysis |
+| [Python Examples](docs/examples/) | Complete stdio and TCP client scripts |
 
 ## Tests
 
 ```bash
 uv sync --group dev
-uv run pytest
+uv run pytest                # all tests (no GPU or weights needed)
+uv run pytest -m "not gpu"   # skip CUDA tests
 ```
-
-No GPU or model weights required.
 
 ## License
 
-[CC-BY-NC-SA-4.0 with additional terms](LICENSE) by Corridor Digital. You may use this tool in commercial projects. You may not repackage/sell it, offer it as a paid API, or integrate into commercial software without agreement. Forks must retain the "Corridor Key" name. Contact: contact@corridordigital.com
+[CC-BY-NC-SA-4.0 with additional terms](LICENSE) by Corridor Digital. Commercial use of the tool is permitted. Repackaging, paid APIs, or integration into commercial software requires agreement. Forks must retain the "Corridor Key" name.
 
 ## Acknowledgements
 
-- [Corridor Digital](https://github.com/nikopueringer/CorridorKey) -- original CorridorKey model and codebase
+- [Corridor Digital](https://github.com/nikopueringer/CorridorKey) -- original model and codebase
 - [GVM](https://github.com/aim-uofa/GVM) (AIM, Zhejiang University) -- BSD-2-Clause
-- [VideoMaMa](https://github.com/cvlab-kaist/VideoMaMa) (CVLAB, KAIST) -- CC BY-NC 4.0, model checkpoints under [Stability AI Community License](https://stability.ai/license)
+- [VideoMaMa](https://github.com/cvlab-kaist/VideoMaMa) (CVLAB, KAIST) -- CC BY-NC 4.0
 - [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) -- MIT
 
 [Corridor Creates Discord](https://discord.gg/zvwUrdWXJm)

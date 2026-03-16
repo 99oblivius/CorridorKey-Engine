@@ -14,6 +14,6 @@ echo "Scanning ClipsForInference..."
 
 # Run via uv (handles the virtual environment automatically)
 cd "$SCRIPT_DIR"
-uv run corridorkey generate-alphas
+uv run corridorkey generate-alphas --model gvm
 
 echo "Done."

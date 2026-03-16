@@ -1,6 +1,6 @@
 [project]
-name = "corridorkey"
-version = "1.0.0"
+name = "corridorkey-engine"
+version = "2.0.0"
 description = "Neural network green screen keying for professional VFX pipelines"
 readme = "README.md"
 requires-python = ">=3.10, <3.15"
@@ -44,6 +44,7 @@ dependencies = [
     # CLI framework + terminal output
     "typer>=0.12",
     "rich>=13",
+    "textual>=1.0.0,<2.0.0",
 ]
 
 [dependency-groups]
@@ -59,19 +60,19 @@ docs = ["zensical>=0.0.24"]
 # Usage: uv pip install torch-tensorrt -f https://github.com/NVIDIA/Torch-TensorRT/releases
 
 [project.scripts]
-corridorkey = "corridorkey_cli:main"
+corridorkey-engine = "ck_engine.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["CorridorKeyModule", "alpha_generators", "alpha_generators/gvm", "alpha_generators/birefnet", "alpha_generators/videomama"]
+packages = ["ck_engine", "CorridorKeyModule", "tui"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-extend-exclude = ["alpha_generators/gvm/", "alpha_generators/videomama/"]
+extend-exclude = []
 
 [tool.ruff.lint]
 select = [
@@ -100,7 +101,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ANN", "T20"]
-"corridorkey_cli.py" = ["T20", "UP045"]  # T20: rich console.print for CLI output; UP045: typer requires Optional[X] not X | None in Annotated
+"ck_engine/cli.py" = ["T20", "UP045"]  # T20: rich console.print for CLI output; UP045: typer requires Optional[X] not X | None in Annotated
+"tui/**" = ["T20"]  # T20: textual log/print for TUI output
 "download_test_scene.py" = ["T20", "ANN"]
 "tools/benchmarks/*" = ["T20", "ANN"]
 
@@ -118,12 +120,8 @@ addopts = "--tb=short"
 
 [tool.coverage.run]
 branch = true
-# "." covers root-level modules (clip_manager.py, corridorkey_cli.py once PR #8 merges).
-# Third-party and non-library code is excluded via omit.
-source = ["CorridorKeyModule", "."]
+source = ["ck_engine", "CorridorKeyModule"]
 omit = [
-    "alpha_generators/gvm/*",
-    "alpha_generators/videomama/*",
     "tests/*",
 ]
 

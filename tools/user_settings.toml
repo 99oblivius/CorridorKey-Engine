@@ -1,0 +1,24 @@
+_version = 1
+
+device = "cuda"
+backend = "auto"
+devices = ["0", "1"]
+img_size = 1024
+read_workers = 0
+write_workers = 0
+cpus = 0
+gpu_resilience = false
+profile = "performance"
+flash_attention = true
+tiled_refiner = true
+cache_clearing = false
+disable_cudnn_benchmark = false
+compile_mode = "default"
+precision = "fp16"
+tile_size = 512
+tile_overlap = 128
+gpu_postprocess = true
+comp_format = "png"
+comp_checkerboard = false
+dma_buffers = 3
+recent_projects = ["/home/livia/Downloads/GreenScreen Tests/test/3", "/home/livia/Downloads/GreenScreen Tests/test/2/Input/", "/home/livia/Downloads/GreenScreen Tests/test/4"]

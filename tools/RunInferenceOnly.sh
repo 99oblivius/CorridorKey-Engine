@@ -14,6 +14,6 @@ echo "Scanning ClipsForInference for Ready Clips (Input + Alpha)..."
 
 # Run via uv (handles the virtual environment automatically)
 cd "$SCRIPT_DIR"
-uv run corridorkey run-inference
+uv run corridorkey inference
 
 echo "Inference Complete."
