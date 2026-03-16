@@ -138,7 +138,7 @@ class RefinerBlock(nn.Module):
         out = self.relu(out)
         out = self.conv2(out)
         out = self.gn2(out)
-        out += residual
+        out = out + residual
         out = self.relu(out)
         return out
 

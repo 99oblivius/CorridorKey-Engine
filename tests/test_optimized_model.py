@@ -310,7 +310,7 @@ class TestOptimizedEngineAPI:
         engine._std_t = torch.tensor(list(IMAGENET_STD)).view(1, 3, 1, 1)
         engine._checker_cache = {}
         engine._checker_cache_cpu = {}
-        engine._refiner_scale = 1.0
+        engine._refiner_scale_t = torch.ones(1)
         engine._refiner_hook_handle = None
         engine._cuda_graph = None
         engine._graph_input = None

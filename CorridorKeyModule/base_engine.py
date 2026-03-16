@@ -165,8 +165,11 @@ class _BaseCorridorKeyEngine(ABC):
         for ev in self._pinned_released:
             ev.set()  # all slots start as "available"
 
-        # Refiner scale hook (registered once, controlled via attribute)
-        self._refiner_scale: float = DEFAULT_REFINER_SCALE
+        # Refiner scale as a device tensor so torch.compile / CUDA graphs
+        # see it as data rather than a traced Python constant.  Must NOT be
+        # a plain float — that would bake the first value into the captured
+        # graph and silently ignore changes on subsequent frames.
+        self._refiner_scale_t: torch.Tensor | None = None  # initialised after model load
         self._refiner_hook_handle = None
 
         # Engine-level optimization: always set explicitly so a previous
@@ -188,13 +191,18 @@ class _BaseCorridorKeyEngine(ABC):
         self._mean_t = torch.tensor(IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
         self._std_t = torch.tensor(IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
 
-        # Register persistent refiner scale hook (must be before torch.compile)
+        # Initialise refiner scale tensor on the model device so it lives
+        # inside the CUDA graph's address space and can be updated via .fill_().
+        self._refiner_scale_t = torch.ones(1, device=self.device, dtype=self.config.model_dtype)
+
+        # Register persistent refiner scale hook (must be before torch.compile).
+        # The hook always multiplies — no Python conditional that would create
+        # a guard and cause graph breaks or bake one branch into a CUDA graph.
         if self.model.refiner is not None:
+            scale_tensor = self._refiner_scale_t  # capture tensor, not 'self'
 
             def _scale_hook(module: torch.nn.Module, input: Any, output: torch.Tensor) -> torch.Tensor:
-                if self._refiner_scale != 1.0:
-                    return output * self._refiner_scale
-                return output
+                return output * scale_tensor
 
             self._refiner_hook_handle = self.model.refiner.register_forward_hook(_scale_hook)
 
@@ -224,12 +232,52 @@ class _BaseCorridorKeyEngine(ABC):
 
                 _inductor_cfg.fx_graph_cache = True
 
+                # CUDA-graph compile modes require fixed memory layout and
+                # cannot tolerate graph breaks from empty_cache(), dynamic
+                # tile loops, or dict caches.  Force-disable incompatible opts.
+                _uses_cuda_graphs = self.config.compile_mode in (
+                    "reduce-overhead", "max-autotune",
+                )
+
                 # torch.cuda.empty_cache() causes graph breaks under
-                # torch.compile.  Force-disable cache clearing so that
-                # _maybe_clear_cache() is a no-op for the rest of this session.
+                # torch.compile.  Force-disable cache clearing on both the
+                # engine config AND the model's config so _maybe_clear_cache()
+                # and effective_cache_clearing are no-ops everywhere.
                 if self.config.cache_clearing:
                     self.config = dataclasses.replace(self.config, cache_clearing=False)
+                    if hasattr(self.model, "config") and self.model.config.cache_clearing:
+                        self.model.config = dataclasses.replace(self.model.config, cache_clearing=False)
                     logger.info("[Compile] Cache clearing force-disabled (incompatible with torch.compile).")
+
+                # Tiled refiner uses Python for-loops, dict caches, and
+                # dynamic torch.zeros — all incompatible with CUDA graphs.
+                # Swap to the non-tiled CNNRefiner for these modes.
+                if _uses_cuda_graphs and self.config.tiled_refiner:
+                    self.config = dataclasses.replace(self.config, tiled_refiner=False)
+                    if hasattr(self.model, "config"):
+                        self.model.config = dataclasses.replace(self.model.config, tiled_refiner=False)
+                    # Replace TiledCNNRefiner with plain CNNRefinerModule
+                    if hasattr(self.model, "refiner") and self.model.refiner is not None:
+                        from .core.model_transformer import CNNRefinerModule
+                        from .core.optimized_model import TiledCNNRefiner
+                        if isinstance(self.model.refiner, TiledCNNRefiner):
+                            plain = CNNRefinerModule(
+                                in_channels=self.model.refiner.stem[0].in_channels,
+                                hidden_channels=self.model.refiner.stem[0].out_channels,
+                                out_channels=self.model.refiner.final.out_channels,
+                            )
+                            plain.load_state_dict(self.model.refiner.state_dict(), strict=False)
+                            plain = plain.to(device=self.device, dtype=self.config.model_dtype)
+                            plain.eval()
+                            self.model.refiner = plain
+                            # Re-register the scale hook on the new refiner
+                            if self._refiner_hook_handle is not None:
+                                self._refiner_hook_handle.remove()
+                            scale_tensor = self._refiner_scale_t
+                            def _scale_hook(module: nn.Module, input: Any, output: torch.Tensor) -> torch.Tensor:
+                                return output * scale_tensor
+                            self._refiner_hook_handle = self.model.refiner.register_forward_hook(_scale_hook)
+                    logger.info("[Compile] Tiled refiner replaced with plain refiner (incompatible with CUDA graphs).")
 
                 # Only disable dynamo on the encoder if timm uses FX-based
                 # FeatureGraphNet (timm <1.0). Newer timm uses FeatureGetterNet
@@ -623,7 +671,7 @@ class _BaseCorridorKeyEngine(ABC):
         del inp_cpu  # safe to release after first GPU op that depends on inp_t
 
         # === 4. Inference ===
-        self._refiner_scale = refiner_scale
+        self._refiner_scale_t.fill_(refiner_scale)
 
         # Cast input to match model weights (e.g. fp16) when autocast is off.
         if inp_t.dtype != self.config.model_dtype:
@@ -701,7 +749,7 @@ class _BaseCorridorKeyEngine(ABC):
             t1 = 0
 
         # Inference (GIL released during CUDA kernels)
-        self._refiner_scale = refiner_scale
+        self._refiner_scale_t.fill_(refiner_scale)
         out = self._run_forward(inp_t)
 
         if _timings is not None:
@@ -804,7 +852,7 @@ class _BaseCorridorKeyEngine(ABC):
             t1 = _time.perf_counter()
 
         # Forward pass
-        self._refiner_scale = refiner_scale
+        self._refiner_scale_t.fill_(refiner_scale)
         out = self._run_forward(inp_t)
 
         if use_events:
@@ -1060,7 +1108,7 @@ class _BaseCorridorKeyEngine(ABC):
             t1 = _time_mod.perf_counter()
 
         # === Forward: one pass for the entire (padded) batch ===
-        self._refiner_scale = refiner_scale
+        self._refiner_scale_t.fill_(refiner_scale)
         out = self._run_forward(inp_t)
 
         if use_events:

@@ -322,56 +322,25 @@ class AsyncInferencePipeline:
         self._warmup_time: float = 0.0  # set by load_engines
 
     def _warmup_engines(self) -> None:
-        """Run a dummy forward pass on each engine to trigger torch.compile.
+        """Trigger torch.compile on each engine.
 
-        GPU 0 compiles first (populates the on-disk FX graph cache with the
-        traced graph + compiled Triton binaries).  Remaining GPUs then warmup
-        in parallel — if the cache is hit they skip tracing and inductor
-        lowering entirely, finishing in seconds instead of minutes.
+        Warmup is deferred to the inference worker threads because
+        torch.compile modes that use CUDA graphs (reduce-overhead,
+        max-autotune) store state in thread-local storage (TLS).
+        Warming up on the main thread would initialise TLS here, but
+        inference runs on worker threads — causing a TLS assertion
+        failure.  By always warming up on the worker thread we avoid
+        this regardless of which compile mode is active or if the user
+        switches modes mid-session.
+
+        The FX graph cache means the worker-thread warmup is fast
+        (~2-5 s) even on first run — inductor code is compiled once
+        and cached on disk.
         """
-
-        def _warmup_one(dev_str: str, engine: Any) -> None:
-            if not dev_str.startswith("cuda"):
-                return
-            torch.cuda.set_device(int(dev_str.split(":")[1]) if ":" in dev_str else 0)
-            logger.info("Compiling kernels for %s...", dev_str)
-            dummy = np.zeros((self.config.img_size, self.config.img_size, 4), dtype=np.float32)
-            t0 = time.perf_counter()
-            try:
-                engine.process_prepared(dummy, self.config.img_size, self.config.img_size)
-            except Exception as e:
-                logger.warning("Engine warmup failed on %s: %s", dev_str, e)
-            logger.info("Kernel compilation for %s done in %.1fs", dev_str, time.perf_counter() - t0)
-
-            # Capture CUDA graph after torch.compile warmup if requested
-            if engine.config.cuda_graphs and engine._cuda_graph is None:
-                try:
-                    engine.capture_cuda_graph()
-                except Exception as e:
-                    logger.warning("CUDA graph capture failed on %s: %s", dev_str, e)
-
-        cuda_engines = [(d, e) for d, e in self.engines if d.startswith("cuda")]
-        if not cuda_engines:
-            return
-
-        # Compile on GPU 0 first.  If the FX cache is warm this is fast
-        # (~5s); if cold it does a full compile (~25s) and populates the
-        # cache.  Either way, remaining GPUs then warmup in parallel and
-        # are guaranteed cache hits — no redundant compilations.
-        #
-        # On a 20-GPU farm:
-        #   Cache warm  → ~5s (GPU 0) + ~5s (GPUs 1-19 parallel) = ~10s
-        #   Cache cold  → ~25s (GPU 0 compile) + ~5s (GPUs 1-19 parallel) = ~30s
-        _warmup_one(*cuda_engines[0])
-
-        if len(cuda_engines) > 1:
-            threads = []
-            for dev_str, engine in cuda_engines[1:]:
-                t = threading.Thread(target=_warmup_one, args=(dev_str, engine), daemon=True)
-                threads.append(t)
-                t.start()
-            for t in threads:
-                t.join()
+        # Manual CUDA graph capture (cuda_graphs=True, separate from
+        # torch.compile modes) still needs an eager warmup before
+        # capture.  This is done on the worker thread as well.
+        pass
 
     def load_engines(self) -> None:
         """Discover GPUs, load one engine per device, and warmup torch.compile.
@@ -756,6 +725,32 @@ class AsyncInferencePipeline:
                 dev_idx = int(device_str.split(":")[1]) if ":" in device_str else 0
                 torch.cuda.set_device(dev_idx)
 
+            # Warmup: run a dummy forward on THIS thread to trigger
+            # torch.compile and initialise any thread-local state (TLS).
+            # CUDA-graph compile modes (reduce-overhead, max-autotune)
+            # use CUDAGraphTreeManager which stores state in TLS — if
+            # warmup ran on a different thread the TLS would be missing
+            # and we'd get: assert torch._C._is_key_in_tls(attr_name).
+            # Running warmup here for ALL modes avoids issues when the
+            # user switches compile modes mid-session.
+            if device_str.startswith("cuda"):
+                logger.info("Compiling kernels for %s...", device_str)
+                t_warmup = time.perf_counter()
+                try:
+                    dummy = np.zeros((self.config.img_size, self.config.img_size, 4), dtype=np.float32)
+                    engine.process_prepared(dummy, self.config.img_size, self.config.img_size)
+                except Exception as e:
+                    logger.warning("Engine warmup failed on %s: %s", device_str, e, exc_info=True)
+                logger.info("Kernel compilation for %s done in %.1fs", device_str, time.perf_counter() - t_warmup)
+
+                # Capture manual CUDA graph after warmup if requested
+                if hasattr(engine, "config") and engine.config.cuda_graphs:
+                    if hasattr(engine, "_cuda_graph") and engine._cuda_graph is None:
+                        try:
+                            engine.capture_cuda_graph()
+                        except Exception as e:
+                            logger.warning("CUDA graph capture failed on %s: %s", device_str, e)
+
             first_frame = True
             pending_transfer = None  # PendingTransfer from previous frame
             pending_packet = None  # FramePacket from previous frame
@@ -852,7 +847,7 @@ class AsyncInferencePipeline:
                         dynamo_retried.add(packet.index)
                         work_q.put(packet)
                         continue
-                    logger.warning("Inference error frame %d on %s: %s", packet.index, device_str, e)
+                    logger.warning("Inference error frame %d on %s: %s", packet.index, device_str, e, exc_info=True)
                     with failed_lock:
                         failed_frames.append(packet.index)
 

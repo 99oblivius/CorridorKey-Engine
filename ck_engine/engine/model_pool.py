@@ -215,10 +215,19 @@ class ModelPool:
         except Exception:
             pass
 
-        # --- Reset torch.compile / dynamo state ---
+        # --- Reset torch.compile / dynamo state AND inductor FX cache ---
         try:
             import torch._dynamo
             torch._dynamo.reset()
+        except Exception:
+            pass
+        try:
+            import torch._inductor.config as _ind_cfg
+            # Invalidate the in-process FX graph cache so stale compiled
+            # kernels (referencing freed CUDA addresses) are not reused
+            # when a new engine is loaded.
+            if hasattr(_ind_cfg, "fx_graph_cache"):
+                _ind_cfg.fx_graph_cache = False
         except Exception:
             pass
 
