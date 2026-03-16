@@ -67,13 +67,14 @@ class ClipProgress(Widget):
 
     def __init__(self, clip_name: str, total_frames: int, **kwargs: object) -> None:
         super().__init__(**kwargs)
-        self._clip_name = clip_name
+        self._clip_label = clip_name  # display name (may contain spaces etc.)
+        self._clip_name = ProgressPanel._sanitize_id(clip_name)  # safe for widget IDs
         self.total = total_frames
         self._start_time: float | None = None
 
     def compose(self) -> ComposeResult:
         with Widget(classes="progress-header"):
-            yield Static(self._clip_name, classes="clip-label")
+            yield Static(self._clip_label, classes="clip-label")
             yield Static("", classes="io-label", id=f"io-{self._clip_name}")
             yield Static("", classes="speed-label", id=f"speed-{self._clip_name}")
             yield Static("", classes="eta-label", id=f"eta-{self._clip_name}")
@@ -168,9 +169,20 @@ class ProgressPanel(Widget):
     def compose(self) -> ComposeResult:
         yield Vertical(id="progress-container")
 
+    @staticmethod
+    def _sanitize_id(name: str) -> str:
+        """Sanitize a name for use in a Textual widget ID.
+
+        Textual IDs may only contain letters, numbers, underscores, and
+        hyphens.  Paths with spaces, parentheses, or other special
+        characters (e.g. ``New folder (4)``) must be cleaned.
+        """
+        import re
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+
     def _tag(self, name: str) -> str:
         """Return a unique ID fragment for *name* in the current epoch."""
-        return f"{name}-{self._epoch}"
+        return f"{self._sanitize_id(name)}-{self._epoch}"
 
     def set_queue(self, clips: list[tuple[str, int]]) -> None:
         """Set the initial queue of clips to process.
