@@ -1,0 +1,100 @@
+/* CorridorKey global stylesheet */
+
+Screen {
+    background: $background;
+}
+
+/* -- Header ------------------------------------------------------------ */
+
+#app-header {
+    dock: top;
+    height: 3;
+    background: $surface;
+    color: $primary;
+    content-align: center middle;
+    text-style: bold;
+    border-bottom: solid $border;
+}
+
+#app-header .brand {
+    color: $primary;
+    text-style: bold;
+}
+
+/* -- Footer ------------------------------------------------------------ */
+
+Footer {
+    background: $surface;
+    color: $text;
+}
+
+FooterKey {
+    background: $surface;
+    color: $text;
+    .footer-key--key {
+        background: $panel;
+        color: $primary;
+    }
+    .footer-key--description {
+        color: $text-muted;
+    }
+}
+
+/* -- Placeholder screens ----------------------------------------------- */
+
+.screen-placeholder {
+    align: center middle;
+}
+
+.screen-placeholder .title {
+    text-style: bold;
+    color: $primary;
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+.screen-placeholder .subtitle {
+    color: $text-muted;
+    text-align: center;
+    width: 100%;
+}
+
+/* -- Terminal too small overlay ---------------------------------------- */
+
+#too-small-overlay {
+    align: center middle;
+    background: $background;
+    layer: overlay;
+}
+
+#too-small-overlay .message {
+    text-align: center;
+    color: $warning;
+    text-style: bold;
+    width: auto;
+    height: auto;
+    padding: 2 4;
+    border: heavy $warning;
+    background: $surface;
+}
+
+/* -- Buttons --------------------------------------------------------------- */
+
+Button.-primary {
+    background: $primary;
+    color: $background;
+    text-style: bold;
+}
+
+Button.-primary:hover {
+    background: $primary;
+    color: $background;
+    text-style: bold reverse;
+}
+
+Button.-primary:focus {
+    background: $primary;
+    color: $background;
+    text-style: bold;
+}
