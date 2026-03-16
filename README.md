@@ -37,18 +37,20 @@ uv run hf download stabilityai/stable-video-diffusion-img2vid-xt \
 ## Quick Start
 
 ```bash
-# TUI (default)
-corridorkey-engine
-corridorkey-engine /path/to/clips
+# Linux / macOS
+./launch.sh                                                          # TUI
+./launch.sh inference /path/to/clips --srgb --despill 5 --refiner 1  # headless
+./launch.sh generate-alphas /path/to/clips --model birefnet          # alpha hints
+./launch.sh serve --listen :9400                                     # TCP daemon
 
-# Headless CLI
-corridorkey-engine inference /path/to/clips --srgb --despill 5 --despeckle --refiner 1.0
-corridorkey-engine generate-alphas /path/to/clips --model birefnet
-
-# Engine server (for integrations)
-corridorkey-engine serve                     # stdio
-corridorkey-engine serve --listen :9400      # TCP daemon
+# Windows
+launch.bat
+launch.bat inference C:\path\to\clips --srgb --despill 5 --refiner 1
 ```
+
+The launch scripts handle `uv`, the virtualenv, and OpenEXR setup automatically.
+You can also run directly with `uv run corridorkey-engine [...]` or install the
+package (`uv pip install -e .`) and use `corridorkey-engine` as a command.
 
 ### Engine API
 
