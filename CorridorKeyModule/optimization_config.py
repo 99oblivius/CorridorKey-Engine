@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .constants import DEFAULT_TILE_OVERLAP, DEFAULT_TILE_SIZE
+
 # ---------------------------------------------------------------------------
 # Optimization Configuration
 # ---------------------------------------------------------------------------
@@ -91,8 +93,8 @@ class OptimizationConfig:
     runs on GPU. When False, uses CPU. GPU is faster at 4K+ but uses ~1.5 GB
     more VRAM. CPU path runs parallel with next frame's inference."""
 
-    output_comp_png: bool = True
-    """Write a composite PNG preview for each frame."""
+    comp_format: str = "exr"
+    """Composite output format: 'exr', 'png', or 'none'."""
 
     comp_checkerboard: bool = False
     """Use checkerboard background for the composite (opaque RGB). When False,
@@ -106,10 +108,10 @@ class OptimizationConfig:
 
     # --- Tiling parameters ---
 
-    tile_size: int = 512
+    tile_size: int = DEFAULT_TILE_SIZE
     """Tile dimension (square) for the tiled refiner."""
 
-    tile_overlap: int = 128
+    tile_overlap: int = DEFAULT_TILE_OVERLAP
     """Overlap in pixels between adjacent tiles.  Must exceed the refiner's
     receptive field (~65 px) for lossless tiling."""
 
@@ -165,8 +167,8 @@ class OptimizationConfig:
 
     @classmethod
     def original(cls) -> OptimizationConfig:
-        """Original behaviour -- no optimizations, no metrics."""
-        return cls()
+        """Original behaviour -- no optimizations, no compilation."""
+        return cls(compile_mode="none")
 
     @classmethod
     def optimized(cls) -> OptimizationConfig:
@@ -182,6 +184,7 @@ class OptimizationConfig:
             model_precision="float16",
             high_matmul_precision=True,
             token_routing=False,
+            compile_mode="none",
             dma_buffers=2,
         )
 
@@ -266,8 +269,8 @@ class OptimizationConfig:
             names.append("tensorrt")
         if not self.gpu_postprocess:
             names.append("cpu_postprocess")
-        if not self.output_comp_png:
-            names.append("no_comp_png")
+        if self.comp_format != "exr":
+            names.append(f"comp_{self.comp_format}")
         if self.comp_checkerboard:
             names.append("comp_checkerboard")
         if self.dma_buffers != 2:

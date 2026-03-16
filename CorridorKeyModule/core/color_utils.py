@@ -7,6 +7,15 @@ import cv2
 import numpy as np
 import torch
 
+from ..constants import (
+    DEFAULT_CHECKER_COLOR1,
+    DEFAULT_CHECKER_COLOR2,
+    DEFAULT_CHECKER_SIZE,
+    DEFAULT_DESPECKLE_SIZE,
+    DEFAULT_MATTE_BLUR,
+    DEFAULT_MATTE_DILATION,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -247,7 +256,7 @@ def despill(
     return despilled
 
 
-def clean_matte(alpha_np: np.ndarray, area_threshold: int = 300, dilation: int = 15, blur_size: int = 5) -> np.ndarray:
+def clean_matte(alpha_np: np.ndarray, area_threshold: int = DEFAULT_DESPECKLE_SIZE, dilation: int = DEFAULT_MATTE_DILATION, blur_size: int = DEFAULT_MATTE_BLUR) -> np.ndarray:
     """
     Cleans up small disconnected components (like tracking markers) from a predicted alpha matte.
     alpha_np: Numpy array [H, W] or [H, W, 1] float (0.0 - 1.0)
@@ -296,7 +305,7 @@ def clean_matte(alpha_np: np.ndarray, area_threshold: int = 300, dilation: int =
 
 
 def create_checkerboard(
-    width: int, height: int, checker_size: int = 64, color1: float = 0.2, color2: float = 0.4
+    width: int, height: int, checker_size: int = DEFAULT_CHECKER_SIZE, color1: float = DEFAULT_CHECKER_COLOR1, color2: float = DEFAULT_CHECKER_COLOR2
 ) -> np.ndarray:
     """
     Creates a linear grayscale checkerboard pattern.

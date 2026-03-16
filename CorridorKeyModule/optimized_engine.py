@@ -13,6 +13,8 @@ import logging
 
 import torch.nn.functional as F
 
+from .constants import DEFAULT_IMG_SIZE, DEFAULT_TILE_OVERLAP, DEFAULT_TILE_SIZE
+
 from .base_engine import _BaseCorridorKeyEngine
 from .core.optimized_model import OptimizedGreenFormer
 from .optimization_config import OptimizationConfig
@@ -36,15 +38,15 @@ class OptimizedCorridorKeyEngine(_BaseCorridorKeyEngine):
         self,
         checkpoint_path: str,
         device: str = "cpu",
-        img_size: int = 2048,
+        img_size: int = DEFAULT_IMG_SIZE,
         use_refiner: bool = True,
         # Legacy per-param API (backward compat)
         use_token_routing: bool = False,
         edge_threshold_low: float = 0.02,
         edge_threshold_high: float = 0.98,
         min_edge_tokens: int = 64,
-        tile_size: int = 512,
-        tile_overlap: int = 128,
+        tile_size: int = DEFAULT_TILE_SIZE,
+        tile_overlap: int = DEFAULT_TILE_OVERLAP,
         # New config-based API (takes precedence when provided)
         optimization_config: OptimizationConfig | None = None,
     ) -> None:

@@ -30,6 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..constants import DEFAULT_IMG_SIZE, DEFAULT_TILE_OVERLAP, DEFAULT_TILE_SIZE
+
 from ..optimization_config import OptimizationConfig
 from .model_transformer import CNNRefinerModule, GreenFormer
 
@@ -275,8 +277,8 @@ class TiledCNNRefiner(CNNRefinerModule):
         in_channels: int = 7,
         hidden_channels: int = 64,
         out_channels: int = 4,
-        tile_size: int = 512,
-        tile_overlap: int = 128,
+        tile_size: int = DEFAULT_TILE_SIZE,
+        tile_overlap: int = DEFAULT_TILE_OVERLAP,
     ) -> None:
         super().__init__(in_channels, hidden_channels, out_channels)
         self.tile_size = tile_size
@@ -395,7 +397,7 @@ class OptimizedGreenFormer(GreenFormer):
         self,
         encoder_name: str = "hiera_base_plus_224.mae_in1k_ft_in1k",
         in_channels: int = 4,
-        img_size: int = 2048,
+        img_size: int = DEFAULT_IMG_SIZE,
         use_refiner: bool = True,
         optimization_config: OptimizationConfig | None = None,
         # Legacy params (backward compat -- used only when config is None)
@@ -403,8 +405,8 @@ class OptimizedGreenFormer(GreenFormer):
         edge_threshold_low: float = 0.02,
         edge_threshold_high: float = 0.98,
         min_edge_tokens: int = 64,
-        tile_size: int = 512,
-        tile_overlap: int = 128,
+        tile_size: int = DEFAULT_TILE_SIZE,
+        tile_overlap: int = DEFAULT_TILE_OVERLAP,
     ) -> None:
         if optimization_config is None:
             optimization_config = OptimizationConfig(

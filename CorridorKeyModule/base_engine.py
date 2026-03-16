@@ -23,6 +23,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .constants import (
+    DEFAULT_CHECKER_COLOR1,
+    DEFAULT_CHECKER_COLOR2,
+    DEFAULT_CHECKER_SIZE,
+    DEFAULT_DESPECKLE_SIZE,
+    DEFAULT_DESPILL_STRENGTH,
+    DEFAULT_IMG_SIZE,
+    DEFAULT_MATTE_BLUR,
+    DEFAULT_MATTE_DILATION,
+    DEFAULT_REFINER_SCALE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
+
 from .core import color_utils as cu
 from .optimization_config import OptimizationConfig
 
@@ -102,7 +116,7 @@ class _BaseCorridorKeyEngine(ABC):
         self,
         checkpoint_path: str,
         device: str = "cpu",
-        img_size: int = 2048,
+        img_size: int = DEFAULT_IMG_SIZE,
         use_refiner: bool = True,
         optimization_config: OptimizationConfig | None = None,
     ) -> None:
@@ -113,16 +127,22 @@ class _BaseCorridorKeyEngine(ABC):
         self.config = optimization_config or OptimizationConfig()
 
         # ImageNet normalization constants (keep on device for GPU preprocessing)
-        self.mean_np = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        self.std_np = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        self.mean_np = np.array(IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3)
+        self.std_np = np.array(IMAGENET_STD, dtype=np.float32).reshape(1, 1, 3)
 
         # GPU-side normalization constants (created after model load)
         self._mean_t: torch.Tensor | None = None
         self._std_t: torch.Tensor | None = None
 
-        # Cached checkerboard (per-resolution, avoids re-allocation every frame)
-        self._checker_cache: dict[tuple[int, int], torch.Tensor] = {}
-        self._checker_cache_cpu: dict[tuple[int, int], np.ndarray] = {}
+        # Cached checkerboard — single-entry cache keyed on (w, h).
+        # A dict is intentionally NOT used here: storing one entry per unique
+        # resolution would grow without bound in mixed-resolution workflows,
+        # leaking VRAM/RAM indefinitely.  Instead we keep only the most-recently-
+        # used resolution and evict when it changes.
+        self._checker_cache_key: tuple[int, int] | None = None
+        self._checker_cache_val: torch.Tensor | None = None
+        self._checker_cache_cpu_key: tuple[int, int] | None = None
+        self._checker_cache_cpu_val: np.ndarray | None = None
 
         # Dedicated copy stream for GPU→CPU transfers (avoids GIL contention
         # in multi-GPU setups).  Compute runs on the default stream; D2H
@@ -146,24 +166,27 @@ class _BaseCorridorKeyEngine(ABC):
             ev.set()  # all slots start as "available"
 
         # Refiner scale hook (registered once, controlled via attribute)
-        self._refiner_scale: float = 1.0
+        self._refiner_scale: float = DEFAULT_REFINER_SCALE
         self._refiner_hook_handle = None
 
-        # Engine-level optimization: disable cuDNN benchmark
-        if self.config.disable_cudnn_benchmark and self.device.type == "cuda":
-            torch.backends.cudnn.benchmark = False
-            logger.info("[Optimized] cuDNN benchmark disabled (saves 2-5 GB workspace).")
+        # Engine-level optimization: always set explicitly so a previous
+        # engine's values don't leak into this one (process-global state).
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = not self.config.disable_cudnn_benchmark
+            if self.config.disable_cudnn_benchmark:
+                logger.info("[Optimized] cuDNN benchmark disabled (saves 2-5 GB workspace).")
 
-        # TF32 matmul precision (Ampere+): negligible quality impact, measurable speedup
         if self.config.high_matmul_precision:
             torch.set_float32_matmul_precision("high")
             logger.info("[Optimized] TF32 matmul precision enabled.")
+        else:
+            torch.set_float32_matmul_precision("highest")
 
         self.model = self._load_model()
 
         # Normalization constants on device (used by process_raw and process_prepared GPU paths)
-        self._mean_t = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-        self._std_t = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+        self._mean_t = torch.tensor(IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+        self._std_t = torch.tensor(IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
 
         # Register persistent refiner scale hook (must be before torch.compile)
         if self.model.refiner is not None:
@@ -187,13 +210,37 @@ class _BaseCorridorKeyEngine(ABC):
             if self.config.tensorrt:
                 self._use_trt = self._try_tensorrt_compile()
 
-            if not self._use_trt:
+            if not self._use_trt and self.config.compile_mode not in ("none", ""):
+                # Clear any stale dynamo state left over from previous engine
+                # loads or code changes.  Without this, a second engine
+                # instantiation in the same process can encounter "FX to
+                # symbolically trace a dynamo-optimized function" errors.
+                torch._dynamo.reset()
+
                 # Enable FX graph cache so graph tracing + inductor lowering
                 # (the single-threaded phases) are skipped on subsequent runs.
                 # Only the first run pays the full compilation cost.
                 import torch._inductor.config as _inductor_cfg
 
                 _inductor_cfg.fx_graph_cache = True
+
+                # torch.cuda.empty_cache() causes graph breaks under
+                # torch.compile.  Force-disable cache clearing so that
+                # _maybe_clear_cache() is a no-op for the rest of this session.
+                if self.config.cache_clearing:
+                    self.config = dataclasses.replace(self.config, cache_clearing=False)
+                    logger.info("[Compile] Cache clearing force-disabled (incompatible with torch.compile).")
+
+                # Only disable dynamo on the encoder if timm uses FX-based
+                # FeatureGraphNet (timm <1.0). Newer timm uses FeatureGetterNet
+                # which is dynamo-compatible and should NOT be disabled.
+                if hasattr(self.model, "encoder"):
+                    encoder_type = type(self.model.encoder).__name__
+                    if encoder_type == "FeatureGraphNet":
+                        self.model.encoder.forward = torch._dynamo.disable(self.model.encoder.forward)
+                        logger.info("[Compile] Encoder is FX-traced (%s) — dynamo skip applied.", encoder_type)
+                    else:
+                        logger.debug("[Compile] Encoder is %s — no dynamo skip needed.", encoder_type)
 
                 self.model = torch.compile(self.model, mode=self.config.compile_mode)
                 mode_label = self.config.compile_mode
@@ -417,27 +464,38 @@ class _BaseCorridorKeyEngine(ABC):
     # ------------------------------------------------------------------
 
     def _get_checkerboard_linear_gpu(self, w: int, h: int) -> torch.Tensor:
-        """Return a cached checkerboard tensor [H, W, 3] on device in linear space."""
+        """Return a cached checkerboard tensor [H, W, 3] on device in linear space.
+
+        Only one resolution is kept in memory at a time.  If the requested
+        (w, h) differs from the cached entry the old GPU tensor is evicted
+        before the new one is allocated, preventing unbounded VRAM growth in
+        mixed-resolution workflows.
+        """
         key = (w, h)
-        if key not in self._checker_cache:
-            checker_size = 128
-            y_coords = torch.arange(h, device=self.device) // checker_size
-            x_coords = torch.arange(w, device=self.device) // checker_size
+        if self._checker_cache_key != key:
+            self._checker_cache_val = None  # release old GPU tensor immediately
+            y_coords = torch.arange(h, device=self.device) // DEFAULT_CHECKER_SIZE
+            x_coords = torch.arange(w, device=self.device) // DEFAULT_CHECKER_SIZE
             y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
             checker = ((x_grid + y_grid) % 2).float()
-            # Map 0 -> 0.15, 1 -> 0.55 (sRGB), then convert to linear before caching
-            bg_srgb = checker * 0.4 + 0.15  # [H, W]
+            # Map 0 -> DEFAULT_CHECKER_COLOR1, 1 -> DEFAULT_CHECKER_COLOR2 (sRGB), then convert to linear before caching
+            bg_srgb = checker * (DEFAULT_CHECKER_COLOR2 - DEFAULT_CHECKER_COLOR1) + DEFAULT_CHECKER_COLOR1  # [H, W]
             bg_srgb_3 = bg_srgb.unsqueeze(-1).expand(-1, -1, 3)
-            self._checker_cache[key] = cu.srgb_to_linear(bg_srgb_3)
-        return self._checker_cache[key]
+            self._checker_cache_val = cu.srgb_to_linear(bg_srgb_3)
+            self._checker_cache_key = key
+        return self._checker_cache_val  # type: ignore[return-value]
 
     def _get_checkerboard_linear_cpu(self, w: int, h: int) -> np.ndarray:
-        """Return a cached checkerboard array [H, W, 3] in linear space."""
+        """Return a cached checkerboard array [H, W, 3] in linear space.
+
+        Only one resolution is kept in memory at a time (see GPU counterpart).
+        """
         key = (w, h)
-        if key not in self._checker_cache_cpu:
-            bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
-            self._checker_cache_cpu[key] = cu.srgb_to_linear(bg_srgb)
-        return self._checker_cache_cpu[key]
+        if self._checker_cache_cpu_key != key:
+            bg_srgb = cu.create_checkerboard(w, h, checker_size=DEFAULT_CHECKER_SIZE, color1=DEFAULT_CHECKER_COLOR1, color2=DEFAULT_CHECKER_COLOR2)
+            self._checker_cache_cpu_val = cu.srgb_to_linear(bg_srgb)
+            self._checker_cache_cpu_key = key
+        return self._checker_cache_cpu_val  # type: ignore[return-value]
 
     @staticmethod
     def _clean_matte_gpu(alpha: torch.Tensor, area_threshold: int, dilation: int, blur_size: int) -> torch.Tensor:
@@ -506,9 +564,9 @@ class _BaseCorridorKeyEngine(ABC):
         refiner_scale: float = 1.0,
         input_is_linear: bool = False,
         fg_is_straight: bool = True,
-        despill_strength: float = 1.0,
+        despill_strength: float = DEFAULT_DESPILL_STRENGTH,
         auto_despeckle: bool = True,
-        despeckle_size: int = 400,
+        despeckle_size: int = DEFAULT_DESPECKLE_SIZE,
     ) -> dict[str, np.ndarray]:
         """Process a single frame.
 
@@ -567,6 +625,10 @@ class _BaseCorridorKeyEngine(ABC):
         # === 4. Inference ===
         self._refiner_scale = refiner_scale
 
+        # Cast input to match model weights (e.g. fp16) when autocast is off.
+        if inp_t.dtype != self.config.model_dtype:
+            inp_t = inp_t.to(dtype=self.config.model_dtype)
+
         out = self._run_forward(inp_t)
 
         pred_alpha = out["alpha"]  # [1, 1, model_size, model_size]
@@ -606,9 +668,9 @@ class _BaseCorridorKeyEngine(ABC):
         orig_w: int,
         refiner_scale: float = 1.0,
         fg_is_straight: bool = True,
-        despill_strength: float = 1.0,
+        despill_strength: float = DEFAULT_DESPILL_STRENGTH,
         auto_despeckle: bool = True,
-        despeckle_size: int = 400,
+        despeckle_size: int = DEFAULT_DESPECKLE_SIZE,
         _timings: dict | None = None,
     ) -> dict[str, np.ndarray]:
         """Fast path: process a pre-prepared [H,W,4] model input.
@@ -792,9 +854,9 @@ class _BaseCorridorKeyEngine(ABC):
         input_is_linear: bool = False,
         refiner_scale: float = 1.0,
         fg_is_straight: bool = True,
-        despill_strength: float = 1.0,
+        despill_strength: float = DEFAULT_DESPILL_STRENGTH,
         auto_despeckle: bool = True,
-        despeckle_size: int = 400,
+        despeckle_size: int = DEFAULT_DESPECKLE_SIZE,
         _timings: dict | None = None,
     ) -> dict[str, np.ndarray]:
         """GPU-accelerated path: upload raw decoded frames and preprocess on device.
@@ -849,9 +911,9 @@ class _BaseCorridorKeyEngine(ABC):
         input_is_linear: bool = False,
         refiner_scale: float = 1.0,
         fg_is_straight: bool = True,
-        despill_strength: float = 1.0,
+        despill_strength: float = DEFAULT_DESPILL_STRENGTH,
         auto_despeckle: bool = True,
-        despeckle_size: int = 400,
+        despeckle_size: int = DEFAULT_DESPECKLE_SIZE,
         _timings: dict | None = None,
     ) -> PendingTransfer:
         """Like :meth:`process_raw` but returns a :class:`PendingTransfer`.
@@ -911,9 +973,9 @@ class _BaseCorridorKeyEngine(ABC):
         input_is_linear: bool = False,
         refiner_scale: float = 1.0,
         fg_is_straight: bool = True,
-        despill_strength: float = 1.0,
+        despill_strength: float = DEFAULT_DESPILL_STRENGTH,
         auto_despeckle: bool = True,
-        despeckle_size: int = 400,
+        despeckle_size: int = DEFAULT_DESPECKLE_SIZE,
         _timings: dict | None = None,
     ) -> list[dict[str, np.ndarray]]:
         """Batched GPU inference: process multiple frames in one forward pass.
@@ -1111,7 +1173,7 @@ class _BaseCorridorKeyEngine(ABC):
 
         # A. Clean matte
         if auto_despeckle:
-            processed_alpha = self._clean_matte_gpu(res_alpha, despeckle_size, dilation=25, blur_size=5)
+            processed_alpha = self._clean_matte_gpu(res_alpha, despeckle_size, dilation=DEFAULT_MATTE_DILATION, blur_size=DEFAULT_MATTE_BLUR)
         else:
             processed_alpha = res_alpha
 
@@ -1127,8 +1189,8 @@ class _BaseCorridorKeyEngine(ABC):
         # E. Pack RGBA on GPU
         processed_rgba = torch.cat([fg_premul_lin, processed_alpha], dim=-1)
 
-        # F. Composite (optional — skip if comp PNG is disabled)
-        if self.config.output_comp_png:
+        # F. Composite (optional — skip if comp output is disabled)
+        if self.config.comp_format != "none":
             if self.config.comp_checkerboard:
                 bg_lin = self._get_checkerboard_linear_gpu(w, h)
                 if fg_is_straight:
@@ -1235,7 +1297,7 @@ class _BaseCorridorKeyEngine(ABC):
             res_alpha = res_alpha[:, :, np.newaxis]
 
         if auto_despeckle:
-            processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=25, blur_size=5)
+            processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=DEFAULT_MATTE_DILATION, blur_size=DEFAULT_MATTE_BLUR)
         else:
             processed_alpha = res_alpha
 
@@ -1244,7 +1306,7 @@ class _BaseCorridorKeyEngine(ABC):
         fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
         processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
 
-        if self.config.output_comp_png:
+        if self.config.comp_format != "none":
             if self.config.comp_checkerboard:
                 bg_lin = self._get_checkerboard_linear_cpu(w, h)
                 if fg_is_straight:

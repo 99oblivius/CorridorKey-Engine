@@ -8,6 +8,8 @@ Pass ``OptimizationConfig.original()`` explicitly to disable them.
 
 from __future__ import annotations
 
+from .constants import DEFAULT_IMG_SIZE
+
 from .base_engine import _BaseCorridorKeyEngine
 from .core.model_transformer import GreenFormer
 from .optimization_config import OptimizationConfig
@@ -25,7 +27,7 @@ class CorridorKeyEngine(_BaseCorridorKeyEngine):
         self,
         checkpoint_path: str,
         device: str = "cpu",
-        img_size: int = 2048,
+        img_size: int = DEFAULT_IMG_SIZE,
         use_refiner: bool = True,
         optimization_config: OptimizationConfig | None = None,
     ) -> None:
@@ -38,6 +40,7 @@ class CorridorKeyEngine(_BaseCorridorKeyEngine):
                 mixed_precision=True,
                 model_precision="float16",
                 high_matmul_precision=True,
+                compile_mode="none",
             )
         super().__init__(
             checkpoint_path=checkpoint_path,
