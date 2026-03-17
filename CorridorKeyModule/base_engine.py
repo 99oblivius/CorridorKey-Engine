@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
 from .constants import (
     DEFAULT_CHECKER_COLOR1,
@@ -564,7 +565,6 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Erode: kill spots smaller than area_threshold
         # A circle of area A has radius r = sqrt(A / pi)
-        import math
 
         erode_r = max(1, int(math.sqrt(area_threshold / math.pi)))
         erode_k = erode_r * 2 + 1
@@ -573,13 +573,14 @@ class _BaseCorridorKeyEngine(ABC):
 
         # Dilate back to restore edges of large regions
         dilate_r = erode_r + (dilation if dilation > 0 else 0)
-        dilate_k = dilate_r * 2 + 1
-        mask = F.max_pool2d(mask, dilate_k, stride=1, padding=dilate_r)
+        repeats = dilate_r // 2
+        for _ in range(repeats):
+            mask = F.max_pool2d(mask, 5, stride=1, padding=2)
 
         # Blur for soft edges
         if blur_size > 0:
             k = int(blur_size * 2 + 1)
-            mask = F.avg_pool2d(mask, k, stride=1, padding=blur_size)
+            mask = TF.gaussian_blur(mask, [k, k])
 
         safe = mask.squeeze(0).squeeze(0)  # [H, W]
         return (a2d * safe).unsqueeze(-1)  # [H, W, 1]
